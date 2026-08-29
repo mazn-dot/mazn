@@ -3,6 +3,7 @@ import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Conflict
 
 import wallets as store
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIME_PERIODS
@@ -129,15 +130,23 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
       return
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+  if isinstance(context.error, Conflict):
+      log.error("Telegram polling conflict: stop every other bot instance using this token, then restart this one")
+      return
+  log.exception("Unhandled bot error", exc_info=context.error)
+
+
 def main():
   if not TELEGRAM_BOT_TOKEN:
       raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-  app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+  app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(False).build()
+  app.add_error_handler(on_error)
   app.add_handler(CommandHandler("start", start))
   app.add_handler(CallbackQueryHandler(buttons))
   app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
   log.info("BNB wallet tracker started")
-  app.run_polling()
+  app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":

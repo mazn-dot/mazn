@@ -45,15 +45,22 @@ def token_meta(contract):
   name = text(rpc("eth_call", [{"to":key,"data":"0x06fdde03"},"latest"]) or "") or symbol
   _meta_cache[key] = {"decimals":decimals,"symbol":symbol,"name":name}; return _meta_cache[key]
 
+def transfer_logs(address, direction, begin, end):
+  topic = topic_address(address)
+  topics = [TRANSFER_TOPIC, topic if direction == "out" else None, topic if direction == "in" else None]
+  result = rpc("eth_getLogs", [{"fromBlock":hex(begin),"toBlock":hex(end),"topics":topics}])
+  if result is not None or end - begin <= 5: return result or []
+  midpoint = (begin + end) // 2
+  return transfer_logs(address, direction, begin, midpoint) + transfer_logs(address, direction, midpoint + 1, end)
+
 def transfers(address, direction, minutes, cap=2000):
   latest_hex = rpc("eth_blockNumber", [])
   if not latest_hex: return {}
   latest = uint(latest_hex); start = max(0, latest - min(max(1, int(minutes * 20)), 40000)); wallet = address.lower()
   out = defaultdict(lambda: {"amount":0.0,"count":0,"symbol":"???","name":""}); processed = 0
   for end in range(latest, start - 1, -2000):
-      begin = max(start, end - 1999); topic = topic_address(address)
-      topics = [TRANSFER_TOPIC, topic if direction == "out" else None, topic if direction == "in" else None]
-      logs = rpc("eth_getLogs", [{"fromBlock":hex(begin),"toBlock":hex(end),"topics":topics}]) or []
+      begin = max(start, end - 1999)
+      logs = transfer_logs(address, direction, begin, end)
       for event in logs:
           contract = (event.get("address") or "").lower()
           if not contract: continue
@@ -121,10 +128,9 @@ def get_top_counterparties(minutes, wallets=None):
       if not latest_hex: continue
       latest = uint(latest_hex); start = max(0, latest - min(max(1, int(minutes * 20)), 40000))
       for end in range(latest, start - 1, -2000):
-          begin = max(start, end - 1999); topic = topic_address(address)
+          begin = max(start, end - 1999)
           for direction in ("in", "out"):
-              topics = [TRANSFER_TOPIC, topic if direction == "out" else None, topic if direction == "in" else None]
-              for event in rpc("eth_getLogs", [{"fromBlock":hex(begin),"toBlock":hex(end),"topics":topics}]) or []:
+              for event in transfer_logs(address, direction, begin, end):
                   raw_topics = event.get("topics") or []
                   if len(raw_topics) < 3: continue
                   sender, receiver = "0x" + raw_topics[1][-40:], "0x" + raw_topics[2][-40:]
