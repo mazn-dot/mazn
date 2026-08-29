@@ -3,7 +3,7 @@ from config import TIME_PERIODS, TOP_N
 from tracker import get_usd_prices
 STABLE = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDD", "USDP", "FRAX", "LUSD", "MIM", "HAY"}
 LARGE = {"BNB", "WBNB", "ETH", "WETH", "BTC", "BTCB", "XRP", "SOL", "ADA", "DOT", "MATIC", "LINK", "UNI", "CAKE", "AAVE", "AVAX", "ATOM"}
-MIN_TRANSFERS = 10
+MIN_TRANSFERS = 1
 SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━"
 SEP2 = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 WIN = {5: "5د", 15: "15د", 30: "30د", 60: "1س", 120: "2س", 240: "4س", 360: "6س", 480: "8س", 720: "12س", 1440: "24س"}
