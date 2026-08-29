@@ -5,7 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import wallets as store
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIME_PERIODS, MORALIS_API_KEY
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIME_PERIODS
 from tracker import get_report, get_opportunity, get_clean_opportunity, get_best_opportunities, get_top_counterparties
 from formatter import format_report, format_opportunity, format_clean_opportunity, format_best_opportunities, format_discovery
 
@@ -86,8 +86,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   if not authorized(update):
       return
   message = "👋 <b>بوت مراقبة محافظ BNB</b>\n\nاختر التقرير:"
-  if not MORALIS_API_KEY:
-      message += "\n\n⚠️ أضف MORALIS_API_KEY في Railway حتى تظهر بيانات التحويلات."
   await update.message.reply_text(message, reply_markup=main_keyboard(), **KW)
 
 
