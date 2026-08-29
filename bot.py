@@ -142,10 +142,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     message = (
-        "👋 <b>بوت مراقبة محافظ BNB</b>\n\n"
-        "• تقارير الدخول/الخروج والفرص\n"
-        "• اكتشاف الحيتان وتتبعها\n"
-        "• الترتيب يعتمد على الكمية + عدد التحويلات\n\n"
+        "👋 <b>بوت مراقبة المحافظ — 5 شبكات</b>\n\n"
+        "BSC · ETH · Base · Arbitrum · Polygon\n\n"
+        "• عرض نظيف: التوكن + سبب جلبه فقط\n"
+        "• Score = كمية + عدد التحويلات\n"
+        "• حيتان + إضافة محافظ\n\n"
         "اختر التقرير:"
     )
     await update.message.reply_text(message, reply_markup=main_keyboard(), **KW)

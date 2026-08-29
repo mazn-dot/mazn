@@ -1,15 +1,8 @@
 import html
-from config import TIME_PERIODS, TOP_N
+from config import CHAINS, MIN_TRANSFERS, TIME_PERIODS, TOP_N
 from tracker import get_usd_prices
 
-STABLE = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDD", "USDP", "FRAX", "LUSD", "MIM", "HAY"}
-LARGE = {
-    "BNB", "WBNB", "ETH", "WETH", "BTC", "BTCB", "XRP", "SOL", "ADA", "DOT",
-    "MATIC", "LINK", "UNI", "CAKE", "AAVE", "AVAX", "ATOM",
-}
-MIN_TRANSFERS = 10
-SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━"
-SEP2 = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+SEP = "━━━━━━━━━━━━━━━━━━"
 WIN = {
     5: "5د", 15: "15د", 30: "30د", 60: "1س", 120: "2س",
     240: "4س", 360: "6س", 480: "8س", 720: "12س", 1440: "24س",
@@ -26,31 +19,29 @@ def safe(a):
     return "0x" + "".join(c for c in s if c in "0123456789abcdef")[:40]
 
 
-def dex(c):
-    return '<a href="https://dexscreener.com/bsc/' + safe(c) + '">📊</a>'
+def chain_label(cid):
+    return CHAINS.get(cid, {}).get("name", cid or "?")
 
 
-def scan(c):
-    return '<a href="https://bscscan.com/token/' + safe(c) + '">🔍</a>'
+def dex_url(item):
+    cid = item.get("chain", "bsc")
+    slug = CHAINS.get(cid, {}).get("dex", "bsc")
+    return "https://dexscreener.com/%s/%s" % (slug, safe(item.get("contract", "")))
 
 
-def addr(c):
-    return '<a href="https://bscscan.com/address/' + safe(c) + '">🔗</a>'
+def explorer_token(item):
+    cid = item.get("chain", "bsc")
+    base = CHAINS.get(cid, {}).get("explorer", "https://bscscan.com")
+    return "%s/token/%s" % (base, safe(item.get("contract", "")))
 
 
-def skip(s):
-    return str(s).upper().strip() in STABLE | LARGE
+def explorer_addr(address, chain="bsc"):
+    base = CHAINS.get(chain, {}).get("explorer", "https://bscscan.com")
+    return "%s/address/%s" % (base, safe(address))
 
 
-def qty(v):
-    v = float(v or 0)
-    if v >= 1e9:
-        return "%.2fB" % (v / 1e9)
-    if v >= 1e6:
-        return "%.2fM" % (v / 1e6)
-    if v >= 1e3:
-        return "%.2fK" % (v / 1e3)
-    return "%.2f" % v if v >= 1 else "%.6f" % v
+def period(m):
+    return next((x for x, n in TIME_PERIODS if n == m), str(m) + "د")
 
 
 def money(v):
@@ -66,224 +57,185 @@ def money(v):
     return "$%.2f" % v
 
 
-def period(m):
-    return next((x for x, n in TIME_PERIODS if n == m), str(m) + "د")
+def qty(v):
+    v = float(v or 0)
+    if v >= 1e9:
+        return "%.2fB" % (v / 1e9)
+    if v >= 1e6:
+        return "%.2fM" % (v / 1e6)
+    if v >= 1e3:
+        return "%.2fK" % (v / 1e3)
+    return "%.2f" % v if v >= 1 else "%.4f" % v
 
 
-def line(i, x, amount, count, prices, score=None):
-    symbol = x.get("symbol", "???")
-    name = x.get("name", "")
-    contract = x.get("contract", "")
-    title = "<code>" + esc(symbol) + "</code>"
-    if name and name.upper() != symbol.upper():
-        title += "  <b>" + esc(name) + "</b>"
-    val = money(prices.get(contract.lower(), 0) * amount)
-    val = "  <b>" + val + "</b>" if val else ""
-    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else str(i) + "."
-    # Show transfer intensity when high
-    intensity = ""
-    if count >= 30:
-        intensity = "  ⚡"
-    elif count >= 15:
-        intensity = "  🔥"
-    score_txt = ""
-    if score and score > amount * 1.2:
-        score_txt = "  · score %.0f" % score
-    return "%s  %s\n     %s%s  •  %s تحويل%s%s  •  %s %s" % (
-        medal, title, qty(amount), val, count, intensity, score_txt, dex(contract), scan(contract)
+def clean_line(i, item, prices=None):
+    """Minimal: token + reason only (no noise)."""
+    symbol = item.get("symbol") or "???"
+    reason = item.get("reason") or "نشاط ملحوظ"
+    chain = chain_label(item.get("chain"))
+    contract = item.get("contract", "")
+    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "%d." % i
+
+    # optional small USD hint if available
+    usd = ""
+    if prices and contract:
+        val = prices.get(contract.lower(), 0) * item.get("amount", 0)
+        if val > 0:
+            usd = "  ·  " + money(val)
+
+    link = ""
+    if contract:
+        link = '  <a href="%s">📊</a>' % dex_url(item)
+
+    return "%s  <code>%s</code>  <i>%s</i>%s%s\n   └ %s" % (
+        medal, esc(symbol), esc(chain), usd, link, esc(reason)
     )
 
 
-def filtered(items):
-    return [
-        x
-        for x in items
-        if x.get("count", x.get("total_count", 0)) >= MIN_TRANSFERS and not skip(x.get("symbol", ""))
-    ]
-
-
 def format_report(data, direction, minutes):
-    title = "📥 الإيداعات" if direction == "in" else "📤 السحوبات"
-    lines = [SEP, title + "  |  " + period(minutes), SEP]
-    combined = {}
-    for label, wallet in data.items():
-        if label == "_meta":
-            continue
-        for key, x in wallet.get("tokens", {}).items():
-            c = x.get("contract", "").lower()
-            if c:
-                combined.setdefault(
-                    c,
-                    {
-                        "contract": c,
-                        "symbol": x.get("symbol", key),
-                        "name": x.get("name", ""),
-                        "amount": 0,
-                        "count": 0,
-                        "score": 0,
-                    },
-                )
-                combined[c]["amount"] += x.get("amount", 0)
-                combined[c]["count"] += x.get("count", 0)
-                combined[c]["score"] += x.get("score", x.get("amount", 0))
-    tokens = [
-        x for x in combined.values() if x["count"] >= MIN_TRANSFERS and not skip(x["symbol"])
-    ]
-    tokens.sort(key=lambda x: x.get("score", x["amount"]), reverse=True)
-    tokens = tokens[:TOP_N]
+    title = "📥 إيداعات" if direction == "in" else "📤 سحوبات"
+    chains = data.get("_meta", {}).get("chains", [])
+    chain_txt = " · ".join(CHAINS.get(c, {}).get("name", c) for c in chains) if chains else "متعدد"
+    lines = [SEP, "%s  |  %s" % (title, period(minutes)), "الشبكات: %s" % chain_txt, SEP]
+
+    tokens = [t for t in (data.get("_combined") or []) if t.get("count", 0) >= MIN_TRANSFERS]
     if not tokens:
-        return "\n".join(lines + ["لا توجد عملات تطابق الفلتر.", SEP])
-    prices = get_usd_prices([x["contract"] for x in tokens])
-    for i, x in enumerate(tokens, 1):
-        lines += [line(i, x, x["amount"], x["count"], prices, x.get("score")), ""]
+        # fallback merge from wallets
+        combined = {}
+        for label, wallet in data.items():
+            if label.startswith("_"):
+                continue
+            for t in wallet.get("tokens", []):
+                ckey = "%s:%s" % (t.get("chain"), t.get("contract"))
+                if ckey not in combined:
+                    combined[ckey] = dict(t)
+                else:
+                    combined[ckey]["amount"] += t.get("amount", 0)
+                    combined[ckey]["count"] += t.get("count", 0)
+                    combined[ckey]["score"] = combined[ckey].get("score", 0) + t.get("score", 0)
+        tokens = sorted(combined.values(), key=lambda x: x.get("score", x.get("amount", 0)), reverse=True)[:TOP_N]
+        for t in tokens:
+            if "reason" not in t:
+                from tracker import build_reason
+                t["reason"] = build_reason(t)
+
+    if not tokens:
+        return "\n".join(lines + ["لا توجد توكنات.", SEP])
+
+    prices = get_usd_prices(tokens)
+    for i, t in enumerate(tokens[:TOP_N], 1):
+        lines.append(clean_line(i, t, prices))
+        lines.append("")
     return "\n".join(lines + [SEP])
 
 
 def format_opportunity(data, minutes):
-    tokens = filtered(data.get("ranked", []))
-    tokens.sort(key=lambda x: x.get("score", x.get("amount", 0)), reverse=True)
-    tokens = tokens[:TOP_N]
-    lines = [SEP, "🎯 الفرصة  |  " + period(minutes), SEP]
+    tokens = data.get("ranked") or []
+    chains = data.get("_meta", {}).get("chains", [])
+    chain_txt = " · ".join(CHAINS.get(c, {}).get("name", c) for c in chains) if chains else ""
+    lines = [SEP, "🎯 فرصة  |  %s" % period(minutes), "الشبكات: %s" % chain_txt, SEP]
     if not tokens:
-        return "\n".join(lines + ["لا توجد سحوبات تطابق الفلتر.", SEP]), ""
-    clean = [
-        {
-            "contract": x["contract"],
-            "symbol": x.get("symbol", "???"),
-            "name": x.get("name", ""),
-            "amount": x.get("amount", x.get("total_amount", 0)),
-            "count": x.get("count", x.get("total_count", 0)),
-            "score": x.get("score", x.get("amount", 0)),
-        }
-        for x in tokens
-    ]
-    prices = get_usd_prices([x["contract"] for x in clean])
-    for i, x in enumerate(clean, 1):
-        lines += [line(i, x, x["amount"], x["count"], prices, x.get("score")), ""]
-    return "\n".join(lines + [SEP]), "https://dexscreener.com/bsc/" + safe(clean[0]["contract"])
+        return "\n".join(lines + ["لا توجد فرص.", SEP]), ""
+    prices = get_usd_prices(tokens)
+    for i, t in enumerate(tokens[:TOP_N], 1):
+        lines.append(clean_line(i, t, prices))
+        lines.append("")
+    url = dex_url(tokens[0]) if tokens else ""
+    return "\n".join(lines + [SEP]), url
 
 
 def format_clean_opportunity(data, minutes):
-    clean = filtered(data.get("clean", []))
-    tainted = filtered(data.get("tainted", []))
-    lines = [SEP, "🚫 الفرصة النقية  |  " + period(minutes), SEP]
+    clean = data.get("clean") or []
+    tainted = data.get("tainted") or []
+    lines = [SEP, "🚫 فرصة نقية  |  %s" % period(minutes), SEP]
     url = ""
     if clean:
-        url = "https://dexscreener.com/bsc/" + safe(clean[0]["contract"])
-        prices = get_usd_prices([x["contract"] for x in clean])
-        lines.append("✅ <b>سحب صافٍ</b>")
-        for i, x in enumerate(clean, 1):
-            lines += [line(i, x, x["amount"], x["count"], prices, x.get("score")), ""]
+        url = dex_url(clean[0])
+        prices = get_usd_prices(clean)
+        lines.append("✅ سحب صافٍ")
+        for i, t in enumerate(clean[:TOP_N], 1):
+            lines.append(clean_line(i, t, prices))
+            lines.append("")
     else:
-        lines.append("✨ لا توجد توكنات نقية تطابق الفلتر.")
+        lines.append("لا توجد سحوبات نقية.")
     if tainted:
-        lines += [SEP2, "⚠️ <b>إيداعات مقابلة — ضغط بيع محتمل</b>"]
-        prices = get_usd_prices([x["contract"] for x in tainted])
-        for i, x in enumerate(tainted, 1):
-            lines.append(
-                "%s. <code>%s</code>  %s  ↑%s ↓%s (%d%%)  %s %s"
-                % (
-                    i,
-                    esc(x["symbol"]),
-                    money(prices.get(x["contract"].lower(), 0) * x["amount"]),
-                    qty(x["amount"]),
-                    qty(x.get("deposit_amount", 0)),
-                    int(x.get("taint_ratio", 0) * 100),
-                    dex(x["contract"]),
-                    scan(x["contract"]),
-                )
-            )
+        lines.append("⚠️ ضغط بيع محتمل")
+        prices = get_usd_prices(tainted)
+        for i, t in enumerate(tainted[:5], 1):
+            lines.append(clean_line(i, t, prices))
+            lines.append("")
     return "\n".join(lines + [SEP]), url
 
 
 def format_best_opportunities(data):
-    tokens = [x for x in data.get("ranked", []) if not skip(x.get("symbol", ""))]
+    tokens = data.get("ranked") or []
     completed = data.get("_meta", {}).get("completed_windows", [])
-    lines = [SEP, "🏆 أفضل الفرص  |  " + " ".join(WIN.get(x, str(x)) for x in completed), SEP]
+    lines = [
+        SEP,
+        "🏆 أفضل الفرص  |  " + " ".join(WIN.get(x, str(x)) for x in completed),
+        SEP,
+    ]
     if not tokens:
         return "\n".join(lines + ["لا توجد توكنات متكررة.", SEP]), ""
-    prices = get_usd_prices([x["contract"] for x in tokens])
-    for i, x in enumerate(tokens[:TOP_N], 1):
-        fire = "🔥🔥🔥" if len(x["windows"]) == len(completed) else "🔥🔥"
-        lines.append(
-            "%s  %s  <code>%s</code>  <b>%s</b>\n     %s  %s  •  %s تحويل  •  %s (%d/%d)  %s %s"
-            % (
-                "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else str(i) + ".",
-                fire,
-                esc(x["symbol"]),
-                esc(x.get("name", "")),
-                qty(x["max_amount"]),
-                money(prices.get(x["contract"].lower(), 0) * x["max_amount"]),
-                x.get("max_count", 0),
-                " ".join(WIN.get(w, str(w)) for w in x["windows"]),
-                len(x["windows"]),
-                len(completed),
-                dex(x["contract"]),
-                scan(x["contract"]),
-            )
-        )
-    return "\n".join(lines + [SEP]), "https://dexscreener.com/bsc/" + safe(tokens[0]["contract"])
+    prices = get_usd_prices(tokens)
+    for i, t in enumerate(tokens[:TOP_N], 1):
+        lines.append(clean_line(i, t, prices))
+        lines.append("")
+    url = dex_url(tokens[0]) if tokens else ""
+    return "\n".join(lines + [SEP]), url
 
 
 def format_discovery(data, minutes):
-    lines = [SEP, "🔭 اكتشاف المحافظ  |  " + period(minutes), SEP]
+    lines = [SEP, "🔭 اكتشاف  |  %s" % period(minutes), SEP]
 
-    def p(x, direction):
-        if direction == "in":
-            value, count = x["vol_in"], x["cnt_in"]
-        elif direction == "out":
-            value, count = x["vol_out"], x["cnt_out"]
-        else:
-            value, count = x["vol_total"], x["cnt_total"]
+    def p(x):
         a = x["addr"]
-        return "<code>%s…%s</code>  %s  •  %s تحويل  %s" % (
-            esc(a[:6]), esc(a[-4:]), qty(value), count, addr(a)
+        return "<code>%s…%s</code>  %s تحويل  <a href=\"%s\">🔗</a>" % (
+            esc(a[:6]), esc(a[-4:]), x.get("cnt_total", x.get("cnt_out", x.get("cnt_in", 0))),
+            explorer_addr(a, data.get("_meta", {}).get("chain", "bsc")),
         )
 
     if data.get("top_withdrawers"):
-        lines += ["📤 <b>أكبر المستلمين</b>"] + [p(x, "out") for x in data["top_withdrawers"][:6]]
+        lines.append("📤 أكبر المستلمين")
+        for x in data["top_withdrawers"][:6]:
+            lines.append(p(x))
     if data.get("top_depositors"):
-        lines += [SEP2, "📥 <b>أكبر المودعين</b>"] + [p(x, "in") for x in data["top_depositors"][:6]]
+        lines.append("")
+        lines.append("📥 أكبر المودعين")
+        for x in data["top_depositors"][:6]:
+            lines.append(p(x))
     if data.get("top_bidirectional"):
-        lines += [SEP2, "🔄 <b>تفاعل من الجانبين</b>"] + [
-            p(x, "both") for x in data["top_bidirectional"][:5]
-        ]
-    return "\n".join(lines + (["لا توجد محافظ متفاعلة."] if len(lines) == 3 else []) + [SEP])
+        lines.append("")
+        lines.append("🔄 تفاعل ثنائي")
+        for x in data["top_bidirectional"][:5]:
+            lines.append(p(x))
+    if len(lines) <= 3:
+        lines.append("لا توجد محافظ.")
+    return "\n".join(lines + [SEP])
 
 
 def format_whales(data):
-    """Format whale discovery results for a token."""
     if data.get("error"):
         return data["error"]
     symbol = data.get("symbol", "???")
-    name = data.get("name", "")
+    chain = chain_label(data.get("chain", "bsc"))
     minutes = data.get("minutes", 60)
     whales = data.get("whales", [])
     lines = [
         SEP,
-        "🐋 حيتان <code>%s</code> %s  |  %s" % (esc(symbol), esc(name) if name != symbol else "", period(minutes)),
+        "🐋 حيتان <code>%s</code>  ·  %s  |  %s" % (esc(symbol), chain, period(minutes)),
         SEP,
     ]
     if not whales:
-        return "\n".join(lines + ["لم يتم العثور على نشاط كافٍ.", SEP])
+        return "\n".join(lines + ["لا يوجد نشاط كافٍ.", SEP])
     for i, w in enumerate(whales, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else str(i) + "."
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "%d." % i
         a = w["addr"]
+        reason = w.get("reason") or ("%d تحويل" % w.get("count", 0))
         lines.append(
-            "%s  <code>%s…%s</code>  %s\n     ↑%s (%d)  ↓%s (%d)  •  %s تحويل  %s"
-            % (
-                medal,
-                esc(a[:6]),
-                esc(a[-4:]),
-                qty(w["total"]),
-                qty(w["in_amount"]),
-                w["in_count"],
-                qty(w["out_amount"]),
-                w["out_count"],
-                w["count"],
-                addr(a),
-            )
+            "%s  <code>%s…%s</code>\n   └ %s  ·  ↑%s ↓%s"
+            % (medal, esc(a[:6]), esc(a[-4:]), esc(reason), qty(w.get("in_amount", 0)), qty(w.get("out_amount", 0)))
         )
         lines.append("")
-    lines.append("💡 أرسل: <code>إضافة حوت اسم 0x...</code> لإضافته للتتبع")
+    lines.append("💡 أرسل: <code>إضافة حوت اسم 0x...</code>")
     return "\n".join(lines + [SEP])

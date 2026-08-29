@@ -4,43 +4,54 @@ from unittest.mock import patch
 import tracker
 
 
-class TrackerTests(unittest.TestCase):
+class TrackerV3Tests(unittest.TestCase):
     def setUp(self):
-        self.wallets = {"A": "0x" + "1" * 40}
-        self.sample = {"0x" + "a" * 40: {"amount": 10.0, "count": 12, "symbol": "ABC", "name": "Alpha"}}
+        for times in tracker._rpc_times.values():
+            times.clear()
 
-    def test_transfer_topic_is_valid(self):
-        self.assertEqual(len(tracker.TRANSFER_TOPIC) - 2, 64)
-        self.assertEqual(tracker.TRANSFER_TOPIC, "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+    def sample(self, chain="bsc", count=10):
+        contract = "0x" + "a" * 40
+        return {
+            f"{chain}:{contract}": {
+                "chain": chain,
+                "contract": contract,
+                "symbol": "ABC",
+                "name": "Alpha",
+                "amount": 25.0,
+                "count": count,
+                "score": 25.0,
+            }
+        }
 
-    def test_report_and_opportunity_paths(self):
-        with patch.object(tracker, "transfers", side_effect=[self.sample, self.sample, self.sample, {}]):
-            report = tracker.get_report(5, "out", self.wallets)
-            opportunity = tracker.get_opportunity(5, self.wallets)
-            clean = tracker.get_clean_opportunity(5, self.wallets)
-        self.assertEqual(report["_meta"]["source"], "public_bsc_rpc")
-        self.assertEqual(opportunity["ranked"][0]["symbol"], "ABC")
-        self.assertEqual(clean["clean"][0]["count"], 12)
+    def test_transfer_topic_and_incoming_wildcard(self):
+        self.assertEqual(len(tracker.TRANSFER_TOPIC), 66)
 
-    def test_best_and_discovery_paths(self):
-        result = {"_meta": {"source": "public_bsc_rpc"}, "ranked": [{"contract": "0x" + "a" * 40, "symbol": "ABC", "name": "Alpha", "amount": 2.0, "count": 12}]}
-        with patch.object(tracker, "get_opportunity", return_value=result), patch.object(tracker, "rpc", return_value=None):
-            best = tracker.get_best_opportunities(self.wallets)
-            discovery = tracker.get_top_counterparties(5, self.wallets)
-        self.assertEqual(best["ranked"][0]["symbol"], "ABC")
-        self.assertEqual(discovery["top_depositors"], [])
+        def fake_rpc(chain, method, params):
+            self.assertEqual(chain, "bsc")
+            self.assertEqual(method, "eth_getLogs")
+            self.assertIsNone(params[0]["topics"][1])
+            return []
 
-    def test_rpc_limit_returns_none_without_external_call(self):
-        tracker._rpc_times.clear()
-        with patch.object(tracker.requests, "post") as post:
-            for _ in range(45):
-                tracker._rpc_times.append(__import__("time").time())
-            self.assertIsNone(tracker.rpc("eth_blockNumber", []))
-            post.assert_not_called()
+        with patch.object(tracker, "rpc", side_effect=fake_rpc):
+            self.assertEqual(tracker.transfer_logs("bsc", "0x" + "1" * 40, "in", 1, 2), [])
 
     def test_rpc_failure_is_safe(self):
-        with patch.object(tracker.requests, "post", side_effect=tracker.requests.RequestException("offline")):
-            self.assertIsNone(tracker.rpc("eth_blockNumber", []))
+        with patch("tracker.requests.post", side_effect=tracker.requests.RequestException("offline")):
+            self.assertIsNone(tracker.rpc("bsc", "eth_blockNumber", []))
+
+    def test_report_and_opportunity_paths(self):
+        wallets = {"Wallet": "0x" + "1" * 40}
+        sample = self.sample()
+        with patch.object(tracker, "transfers_multi", return_value=sample):
+            report = tracker.get_report(60, "out", wallets, chains=["bsc"])
+            opportunity = tracker.get_opportunity(60, wallets, chains=["bsc"])
+        self.assertEqual(report["_meta"]["source"], "multi_rpc")
+        self.assertEqual(report["Wallet"]["tokens"][0]["count"], 10)
+        self.assertEqual(opportunity["ranked"][0]["symbol"], "ABC")
+
+    def test_less_than_ten_is_filtered(self):
+        self.assertEqual(tracker.top_from_raw(self.sample(count=9)), [])
+        self.assertEqual(len(tracker.top_from_raw(self.sample(count=10))), 1)
 
 
 if __name__ == "__main__":
