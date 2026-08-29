@@ -9,6 +9,10 @@ class TrackerTests(unittest.TestCase):
         self.wallets = {"A": "0x" + "1" * 40}
         self.sample = {"0x" + "a" * 40: {"amount": 10.0, "count": 12, "symbol": "ABC", "name": "Alpha"}}
 
+    def test_transfer_topic_is_valid(self):
+        self.assertEqual(len(tracker.TRANSFER_TOPIC) - 2, 64)
+        self.assertEqual(tracker.TRANSFER_TOPIC, "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
     def test_report_and_opportunity_paths(self):
         with patch.object(tracker, "transfers", side_effect=[self.sample, self.sample, self.sample, {}]):
             report = tracker.get_report(5, "out", self.wallets)
