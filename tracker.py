@@ -3,7 +3,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from config import TOP_N
-RPC = "https://bsc-dataseed.binance.org"
+RPC = "https://rpc-bnb.blockmachine.io"
 DEX = "https://api.dexscreener.com/latest/dex/tokens/"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 CHAIN = "bsc"
@@ -47,7 +47,7 @@ def token_meta(contract):
 
 def transfer_logs(address, direction, begin, end):
   topic = topic_address(address)
-  topics = [TRANSFER_TOPIC, topic if direction == "out" else None, topic if direction == "in" else None]
+  topics = [TRANSFER_TOPIC, topic] if direction == "out" else [TRANSFER_TOPIC, [], topic]
   result = rpc("eth_getLogs", [{"fromBlock":hex(begin),"toBlock":hex(end),"topics":topics}])
   if result is not None or end - begin <= 5: return result or []
   midpoint = (begin + end) // 2
