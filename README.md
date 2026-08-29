@@ -1,6 +1,12 @@
 # BNB Wallet Tracker Bot
 
-Telegram bot for monitoring BEP-20 transfers on BNB Smart Chain.
+بوت Telegram لمراقبة تحويلات BEP-20 على BNB Smart Chain.
 
-Required environment variables: TELEGRAM_BOT_TOKEN and MORALIS_API_KEY.
-Run: pip install -r requirements.txt && python bot.py
+## متغيرات Railway المطلوبة
+
+- TELEGRAM_BOT_TOKEN: توكن البوت من BotFather.
+- TELEGRAM_CHAT_ID: رقم المحادثة المالكة للبوت.
+
+MORALIS_API_KEY اختياري من ناحية التشغيل، لكنه مطلوب فعلياً لجلب بيانات التحويلات والأسعار. لا ترسل هذا المفتاح داخل Telegram؛ أضفه كسِرّ في Railway.
+
+أمر التشغيل: python bot.py
