@@ -56,19 +56,26 @@ def transfer_logs(address, direction, begin, end):
 def transfers(address, direction, minutes, cap=2000):
   latest_hex = rpc("eth_blockNumber", [])
   if not latest_hex: return {}
-  latest = uint(latest_hex); start = max(0, latest - min(max(1, int(minutes * 20)), 40000)); wallet = address.lower()
-  out = defaultdict(lambda: {"amount":0.0,"count":0,"symbol":"???","name":""}); processed = 0
+  latest = uint(latest_hex); start = max(0, latest - min(max(1, int(minutes * 20)), 40000))
+  raw = defaultdict(lambda: {"raw_amount": 0, "count": 0})
+  processed = 0
   for end in range(latest, start - 1, -2000):
       begin = max(start, end - 1999)
-      logs = transfer_logs(address, direction, begin, end)
-      for event in logs:
+      for event in transfer_logs(address, direction, begin, end):
           contract = (event.get("address") or "").lower()
           if not contract: continue
-          meta = token_meta(contract); decimals = meta["decimals"]
-          item = out[contract]; item["amount"] += uint(event.get("data","0x")) / (10 ** decimals if decimals else 1); item["count"] += 1; item["symbol"], item["name"] = meta["symbol"], meta["name"]; processed += 1
-          if processed >= cap: return dict(out)
-      if begin == start: break
-  return dict(out)
+          raw[contract]["raw_amount"] += uint(event.get("data", "0x"))
+          raw[contract]["count"] += 1
+          processed += 1
+          if processed >= cap: break
+      if begin == start or processed >= cap: break
+  ranked = sorted(raw.items(), key=lambda pair: pair[1]["raw_amount"], reverse=True)[:TOP_N * 2]
+  out = {}
+  for contract, item in ranked:
+      meta = token_meta(contract)
+      decimals = meta["decimals"]
+      out[contract] = {"amount": item["raw_amount"] / (10 ** decimals if decimals else 1), "count": item["count"], "symbol": meta["symbol"], "name": meta["name"]}
+  return out
 
 def top(raw, limit=TOP_N):
   result = {}
