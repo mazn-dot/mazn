@@ -194,13 +194,13 @@ class TelegramController:
         return "\n".join(lines)
 
     def _fetch_wallet_holdings(self) -> dict[str, float]:
-        """يجيب كل رصيد عملة فعلًا موجود في المحفظة دلوقتي (من Bitget مباشرة).
+        """يجيب كل رصيد عملة فعلًا موجود في المحفظة دلوقتي (من MEXC مباشرة).
         بيرجع dict {base_currency: balance} لكل عملة رصيدها أكبر من صفر (ومقفلها أقل
         من الكمية المحجوزة لأوامر بيع مفتوحة حتى نعرض الكمية المتاحة فعلًا)."""
         try:
             bal = self.exchange.client.fetch_balance()
         except Exception as e:
-            logger.warning(f"تعذر جلب رصيد المحفظة من Bitget: {e}")
+            logger.warning(f"تعذر جلب رصيد المحفظة من MEXC: {e}")
             return {}
         holdings: dict[str, float] = {}
         open_sell_reserved = {}
@@ -249,7 +249,7 @@ class TelegramController:
         return matched
 
     async def _text_positions(self) -> str:
-        """يعرض فقط المراكز المفتوحة فعليًا في محفظة Bitget دلوقتي (مش السجل)،
+        """يعرض فقط المراكز المفتوحة فعليًا في محفظة MEXC دلوقتي (مش السجل)،
         بنسبة الربح/الخسارة غير المحققة بشكل مبسّط، ومدمجًا لكل عملة في سطر واحد."""
         holdings = self._fetch_wallet_holdings()
         if not holdings:

@@ -1,6 +1,6 @@
-# Bitget Signal-Copy Bot
+# MEXC Signal-Copy Bot
 
-بوت تداول سبوت آلي لمنصة Bitget، بيعتمد بالكامل على توصيات قنوات تليجرام
+بوت تداول سبوت آلي لمنصة MEXC، بيعتمد بالكامل على توصيات قنوات تليجرام
 المراقَبة (مفيش استراتيجية داخلية زي EMA/RSI). مبني بلغة Python، جاهز للنشر
 على Railway.
 
@@ -15,7 +15,7 @@
 2. لما توصية تجيلها الشكل المتوقع (اسم عملة + Enter + Stop + Target)، البوت
    يشتري Spot فوراً بمبلغ ثابت (قابل للتعديل)، ويراقب السعر لحد ما يوصل
    للستوب لوس أو هدف الربح، وبيقفل المركز (بيع) تلقائياً.
-3. **Railway فيه بس أسرار الاتصال** (Bitget + تليجرام + قاعدة البيانات) -
+3. **Railway فيه بس أسرار الاتصال** (MEXC + تليجرام + قاعدة البيانات) -
    **كل حاجة تانية بتتحكم فيها لايف من تليجرام** بلوحة أزرار كاملة (`/menu`).
 
 ## ⭐ أوامر تليجرام
@@ -79,9 +79,8 @@ Railway هيحط متغير `DATABASE_URL` تلقائياً - متلمسهوش �
 **أساسية (لازم البوت يشتغل من غيرها):**
 | المتغير | من فين |
 |---|---|
-| `BITGET_API_KEY` | من إعدادات API في Bitget (صلاحية Spot Trade بس، من غير Withdraw) |
-| `BITGET_API_SECRET` | من إعدادات API في Bitget |
-| `BITGET_API_PASSPHRASE` | حددتها إنت وقت إنشاء الـ API key |
+| `MEXC_API_KEY` | من إعدادات API في MEXC (صلاحية Spot Trade بس، من غير Withdraw) |
+| `MEXC_API_SECRET` | من إعدادات API في MEXC |
 | `TELEGRAM_BOT_TOKEN` | من @BotFather |
 | `TELEGRAM_CHAT_ID` | آيديك من @userinfobot |
 | `DATABASE_URL` | **متضافش يدوي** — بتيجي تلقائي من Postgres plugin |
@@ -100,7 +99,7 @@ Railway هيحط متغير `DATABASE_URL` تلقائياً - متلمسهوش �
 | `TELEGRAM_SESSION_STRING` | بتتولد مرة واحدة محلياً - شوف تحت |
 | `SIGNAL_CHANNELS` | يوزر أو آيدي القناة/القنوات، مفصولين بفاصلة |
 
-**نصيحة أمان**: صلاحيات الـ API key في Bitget خليها Trade فقط، وامنع صلاحية السحب (Withdraw) نهائياً.
+**نصيحة أمان**: صلاحيات الـ API key في MEXC خليها Trade فقط، وامنع صلاحية السحب (Withdraw) نهائياً.
 
 ### د) التشغيل
 Railway هيشغل `python -m bot.main` تلقائياً (حسب `Dockerfile`). لو لقيت خطأ

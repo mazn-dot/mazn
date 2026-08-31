@@ -16,7 +16,7 @@ import time
 import sys
 
 from .config import Config
-from .exchange import BitgetExchange
+from .exchange import MexcExchange
 from .risk import RiskManager
 from .database import Database
 from .state import shared_state
@@ -170,7 +170,7 @@ def run():
     _sell_error_counts: dict[str, int] = {}
     _SELL_ERROR_LIMIT = 10
 
-    exchange = BitgetExchange()
+    exchange = MexcExchange()
     risk = RiskManager()
     db = Database()
 
@@ -227,7 +227,7 @@ def run():
                         telegram.notify(
                             f"⚠ تم إيقاف محاولات مراقبة/بيع {symbol}\n"
                             f"السبب: فشل البيع { _SELL_ERROR_LIMIT} مرات متتالية "
-                            "(الأرجح مشكلة من المنصة أو رصيد - راجع صفقاتك على Bitget يدويًا)."
+                            "(الأرجح مشكلة من المنصة أو رصيد - راجع صفقاتك على MEXC يدويًا)."
                         )
                         logger.error(
                             f"{symbol}: تجاوز حد الأخطاء - توقف عن محاولات البيع تلقائيًا."

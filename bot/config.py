@@ -6,10 +6,9 @@ import os
 
 
 class Config:
-    # ---- Bitget API credentials ----
-    BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-    BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-    BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
+    # ---- MEXC API credentials ----
+    MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+    MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
 
     # ---- بوت تليجرام (التحكم الكامل) ----
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -55,12 +54,10 @@ class Config:
     @classmethod
     def validate(cls):
         missing = []
-        if not cls.BITGET_API_KEY:
-            missing.append("BITGET_API_KEY")
-        if not cls.BITGET_API_SECRET:
-            missing.append("BITGET_API_SECRET")
-        if not cls.BITGET_API_PASSPHRASE:
-            missing.append("BITGET_API_PASSPHRASE")
+        if not cls.MEXC_API_KEY:
+            missing.append("MEXC_API_KEY")
+        if not cls.MEXC_API_SECRET:
+            missing.append("MEXC_API_SECRET")
         if not cls.TELEGRAM_BOT_TOKEN:
             missing.append("TELEGRAM_BOT_TOKEN")
         if not cls.TELEGRAM_CHAT_ID:

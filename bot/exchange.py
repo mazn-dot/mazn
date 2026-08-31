@@ -1,5 +1,5 @@
 """
-طبقة التواصل مع Bitget عبر مكتبة ccxt - تداول SPOT فقط.
+طبقة التواصل مع MEXC عبر مكتبة ccxt - تداول SPOT فقط.
 مفيش رافعة مالية ومفيش أوامر reduceOnly/positions (دي مفاهيم فيوتشرز).
 كل "مركز" هنا هو رصيد فعلي من العملة الأساسية تم شراؤه، وبيتقفل ببيعه.
 """
@@ -12,12 +12,11 @@ from .state import shared_state
 logger = logging.getLogger("exchange")
 
 
-class BitgetExchange:
+class MexcExchange:
     def __init__(self):
         params = {
-            "apiKey": Config.BITGET_API_KEY,
-            "secret": Config.BITGET_API_SECRET,
-            "password": Config.BITGET_API_PASSPHRASE,
+            "apiKey": Config.MEXC_API_KEY,
+            "secret": Config.MEXC_API_SECRET,
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
@@ -25,7 +24,7 @@ class BitgetExchange:
                 "createMarketBuyOrderRequiresPrice": False,
             },
         }
-        self.client = ccxt.bitget(params)
+        self.client = ccxt.mexc(params)
 
     @property
     def dry_run(self) -> bool:
@@ -37,7 +36,7 @@ class BitgetExchange:
 
     def is_valid_spot_symbol(self, symbol: str) -> tuple[bool, str]:
         """
-        يتأكد إن الرمز موجود فعلاً كسوق سبوت على Bitget قبل ما نضيفه للتداول.
+        يتأكد إن الرمز موجود فعلاً كسوق سبوت على MEXC قبل ما نضيفه للتداول.
         بيرجع (True, "") لو تمام، أو (False, "سبب الرفض") لو مش صالح.
         """
         try:
@@ -55,7 +54,7 @@ class BitgetExchange:
                 if self.client.markets[m].get("spot") and m.upper().startswith(base + "/")
             })
             hint = f" أقرب رموز موجودة لنفس العملة: {', '.join(suggestions[:5])}" if suggestions else ""
-            return False, f"الرمز {symbol} مش موجود على Bitget أصلاً.{hint}"
+            return False, f"الرمز {symbol} مش موجود على MEXC أصلاً.{hint}"
 
         if not market.get("spot", False):
             return False, f"الرمز {symbol} موجود بس كفيوتشرز/عقود مش كسبوت. البوت ده لتداول السبوت فقط."
@@ -131,8 +130,8 @@ class BitgetExchange:
         raise last_error
 
     def round_amount_for_market(self, symbol: str, amount: float) -> float:
-        """يقرب الكمية لأدق دقة مقبولة من المنصة عشان ما ترفضها (مثلاً Bitget
-        يرفض كميات أدق من الحد الأدنى للدقة - مثل MASK 0.0001 / SKY 0.01).
+        """يقرب الكمية لأدق دقة مقبولة من المنصة عشان ما ترفضها (مثلاً MEXC
+        يرفض كميات أدق من الحد الأدنى للدقة).
         بيرجع الكمية مربعة لأسفل (مش بتزيد الكمية عن المتاحة أبدًا)."""
         try:
             market = self.client.markets.get(symbol)
@@ -166,8 +165,8 @@ class BitgetExchange:
 
     # =========================================================================
     # أوامر TP/SL على المنصة نفسها (trigger / plan orders) - طبقة حماية خارجية
-    # Bitget Spot لا يدعم stopLossPrice/takeProfitPrice (دي فيوتشرز)، لكن يدعم
-    # أوامر شرطية منفصلة (plan orders) - كل هدف وكل ستوب أمر مستقل.
+    # MEXC Spot يدعم أوامر شرطية عبر triggerPrice في ccxt.
+    # كل هدف وكل ستوب أمر مستقل.
     # =========================================================================
     def create_trigger_sell(self, symbol: str, amount: float, trigger_price: float):
         """
@@ -217,8 +216,9 @@ class BitgetExchange:
         return results
 
     def fetch_open_plan_orders(self, symbol: str):
-        """جلب الأوامر الشرطية (plan orders) المفتوحة - مفيد للتشخيص والإلغاء."""
+        """جلب الأوامر الشرطية (plan/trigger orders) المفتوحة - مفيد للتشخيص والإلغاء."""
         try:
+            # بعض المنصات تحتاج params إضافية للأوامر الشرطية
             return self.client.fetch_open_orders(symbol, params={"stop": True})
         except Exception as e:
             logger.error(f"{symbol}: فشل جلب الأوامر الشرطية: {e}")
@@ -236,7 +236,7 @@ class BitgetExchange:
             return None
 
     def replace_sl_order(self, symbol: str, old_order_id: str, new_stop: float, total_amount: float):
-        """لما الستوب يتحرك (trailing): يلغي أمر SL القديم ويضع واحد جديد بسعر الستوب الجديد."""
+        """لما الستوب يتحرك (trailing): يلغي أمر SL القديمة ويضع واحد جديد بسعر الستوب الجديد."""
         errors = []
         if old_order_id:
             try:
