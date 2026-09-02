@@ -235,15 +235,15 @@ class MexcExchange:
                 results["errors"].append(f"TP@{target}: {e}")
                 logger.error(f"{symbol}: فشل وضع أمر TP عند {target}: {e}")
 
+        # ملاحظة مهمة: أوامر الـ Trigger على MEXC بتحجز الرصيد.
+        # لو حطينا 3 أوامر TP بالكمية كاملة + أمر SL بنفس الكمية → Oversold.
+        # لذلك بنحط أوامر الـ TP فقط على المنصة، والـ SL بيتحمى بالمراقبة الداخلية في البوت.
         if sl is not None and total_amount > 0:
-            try:
-                order = self.create_trigger_sell(symbol, total_amount, sl)
-                order_id = order.get("id") if isinstance(order, dict) else getattr(order, "id", None)
-                results["sl"] = {"stop": sl, "amount": total_amount, "order_id": order_id}
-                logger.info(f"{symbol}: تم وضع أمر SL على المنصة - stop={sl} amount={total_amount} id={order_id}")
-            except Exception as e:
-                results["errors"].append(f"SL@{sl}: {e}")
-                logger.error(f"{symbol}: فشل وضع أمر SL عند {sl}: {e}")
+            logger.info(
+                f"{symbol}: تم تخطي أمر SL على المنصة (stop={sl}) "
+                "عشان أوامر الـ TP حجزت الرصيد — الحماية الداخلية شغالة."
+            )
+            results["sl"] = {"stop": sl, "amount": total_amount, "order_id": None, "skipped": True}
 
         return results
 

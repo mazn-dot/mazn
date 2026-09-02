@@ -157,21 +157,59 @@ class SignalListener:
             _reject(f"فشل تنفيذ أمر الشراء: {e}")
             return
 
-        # استنى شوية عشان الرصيد يتحدث على المنصة، بعدين هات الكمية الفعلية
         import time
-        time.sleep(1.8)
-        actual_amount = self.exchange.fetch_base_balance(spot_symbol)
-        if actual_amount is None or actual_amount <= 0:
-            # محاولة ثانية بعد انتظار إضافي
+        expected_amount = round(fixed_usdt / current_price, 6)
+        if shared_state.is_dry_run():
+            # في وضع التجربة: نحسب الكمية المتوقعة من السعر (مش نجيب رصيد حقيقي = dust)
+            total_amount = expected_amount
+            logger.info(f"{spot_symbol}: [DRY_RUN] كمية متوقعة = {total_amount} (من {fixed_usdt} USDT @ {current_price})")
+        else:
+            # تداول حقيقي: جرب نطلع الكمية من رد الأمر، وإلا من رصيد المحفظة
+            filled = None
+            if isinstance(order, dict):
+                filled = order.get("filled") or order.get("amount")
+                if filled is not None:
+                    try:
+                        filled = float(filled)
+                    except (TypeError, ValueError):
+                        filled = None
+
             time.sleep(1.5)
             actual_amount = self.exchange.fetch_base_balance(spot_symbol)
+            if actual_amount is None or actual_amount <= 0:
+                time.sleep(1.5)
+                actual_amount = self.exchange.fetch_base_balance(spot_symbol)
 
-        if actual_amount is None or actual_amount <= 0:
-            _reject(f"الشراء اتنفذ بس الرصيد الفعلي من العملة صفر أو غير متاح: {actual_amount}")
-            return
+            # نختار أفضل تقدير: filled من الأمر > رصيد المحفظة > الكمية المتوقعة
+            candidates = []
+            if filled and filled > 0:
+                candidates.append(("order_filled", filled))
+            if actual_amount and actual_amount > 0:
+                candidates.append(("wallet", float(actual_amount)))
+            candidates.append(("expected", expected_amount))
 
-        total_amount = round(float(actual_amount), 6)
-        logger.info(f"{spot_symbol}: الكمية الفعلية بعد الشراء = {total_amount}")
+            # لو الرصيد أكبر بكتير من المتوقع (كان فيه رصيد قديم)، استخدم المتوقع أو filled
+            chosen_name, total_amount = candidates[0]
+            if chosen_name == "wallet" and expected_amount > 0:
+                # لو الرصيد أكبر من المتوقع بـ 30%+ يبقى فيه dust قديم → استخدم المتوقع أو filled
+                if total_amount > expected_amount * 1.3 and filled and filled > 0:
+                    chosen_name, total_amount = "order_filled", filled
+                elif total_amount > expected_amount * 1.3:
+                    chosen_name, total_amount = "expected", expected_amount
+                # لو الرصيد أصغر بكتير من المتوقع (شراء جزئي) استخدم الرصيد الفعلي
+                elif total_amount < expected_amount * 0.5:
+                    logger.warning(
+                        f"{spot_symbol}: الرصيد الفعلي ({total_amount}) أقل من المتوقع ({expected_amount}) — شراء جزئي؟"
+                    )
+
+            total_amount = round(float(total_amount), 6)
+            if total_amount <= 0:
+                _reject(f"كمية غير صالحة بعد الشراء: {total_amount}")
+                return
+            logger.info(
+                f"{spot_symbol}: كمية مستخدمة = {total_amount} "
+                f"(مصدر={chosen_name}, متوقع={expected_amount}, محفظة={actual_amount}, filled={filled})"
+            )
 
         # ---- تقسيم الكمية على 3 أهداف بالظبط (بغض النظر عن عدد أهداف التوصية) ----
         three_targets = normalize_to_three_targets(current_price, parsed.targets)
