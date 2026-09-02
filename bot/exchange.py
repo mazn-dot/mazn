@@ -20,7 +20,7 @@ class MexcExchange:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
-                # يسمح بأوامر شراء ماركت بالكمية (base amount) من غير ما نحتاج نحسب التكلفة يدوي
+                # نفضل استخدام quoteOrderQty للشراء بالـ USDT (أضمن على MEXC)
                 "createMarketBuyOrderRequiresPrice": False,
             },
         }
@@ -91,40 +91,68 @@ class MexcExchange:
             logger.error(f"فشل جلب رصيد {symbol}: {e}")
             return 0.0
 
-    def create_market_buy(self, symbol: str, amount: float, max_retries: int = 2):
-        """شراء سبوت بسعر السوق - amount بالعملة الأساسية (base currency).
-        لو ccxt اشتكى من احتياجه لسعر السوق لحساب التكلفة (InvalidOrder مع رسالة
-        createMarketBuyOrderRequiresPrice)، بنجيب السعر الحالي من المنصة ونمرره
-        صراحة، ولو فشلنا كمان بنعيد المحاولة مرة واحدة قبل ما نرفع الخطأ."""
+    def create_market_buy(self, symbol: str, amount: float = None, cost: float = None, max_retries: int = 2):
+        """شراء سبوت بسعر السوق.
+        يُفضل تمرير cost (مبلغ بالـ USDT) عبر quoteOrderQty — الطريقة الأضمن على MEXC.
+        لو اتمرر amount فقط (كمية بالعملة الأساسية) بيتم استخدامه كـ fallback.
+        """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] MARKET BUY {amount} {symbol}")
-            return {"id": "dry-run", "symbol": symbol, "side": "buy", "amount": amount, "status": "dry_run"}
+            logger.info(f"[DRY_RUN] MARKET BUY amount={amount} cost={cost} {symbol}")
+            return {
+                "id": "dry-run",
+                "symbol": symbol,
+                "side": "buy",
+                "amount": amount,
+                "cost": cost,
+                "status": "dry_run",
+            }
 
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                # محاولة أولى عادية - الخيارات options مع createMarketBuyOrderRequiresPrice=False
-                # المفروض تغطي الحالة، لكن بعض إعدادات المنصة/نسخ ccxt ممكن ترفضها
-                return self.client.create_order(symbol, type="market", side="buy", amount=amount)
+                if cost is not None and cost > 0:
+                    # الطريقة المضمونة: شراء بمبلغ ثابت بالـ USDT
+                    order = self.client.create_order(
+                        symbol,
+                        type="market",
+                        side="buy",
+                        amount=None,
+                        params={"quoteOrderQty": float(cost)},
+                    )
+                    logger.info(f"{symbol}: MARKET BUY بـ {cost} USDT | order_id={order.get('id')}")
+                    return order
+                else:
+                    # fallback: كمية بالعملة الأساسية
+                    order = self.client.create_order(
+                        symbol, type="market", side="buy", amount=amount
+                    )
+                    logger.info(f"{symbol}: MARKET BUY كمية={amount} | order_id={order.get('id')}")
+                    return order
             except ccxt.InvalidOrder as e:
                 last_error = e
-                if "createMarketBuyOrderRequiresPrice" not in str(e):
+                msg = str(e)
+                if "createMarketBuyOrderRequiresPrice" not in msg and "quoteOrderQty" not in msg.lower():
                     raise
                 if attempt >= max_retries:
                     break
                 logger.warning(
-                    f"ccxt طلب سعر السوق لحساب تكلفة شراء {symbol} - "
-                    "بنجيب السعر الحالي وبنمرره صراحة في أمر الشراء (محاولة {attempt}/{max_retries})"
+                    f"ccxt طلب تعديل طريقة الشراء لـ {symbol} - "
+                    f"محاولة احتياطية ({attempt}/{max_retries}): {e}"
                 )
                 try:
                     price = self.fetch_last_price(symbol)
+                    if cost is not None and cost > 0:
+                        fallback_amount = float(cost) / price
+                        return self.client.create_order(
+                            symbol, type="market", side="buy", amount=fallback_amount, price=price
+                        )
+                    return self.client.create_order(
+                        symbol, type="market", side="buy", amount=amount, price=price
+                    )
                 except Exception as fetch_err:
                     raise ccxt.InvalidOrder(
                         f"{e} (كمان تعذر جلب السعر الحالي للمحاولة الاحتياطية: {fetch_err})"
                     )
-                return self.client.create_order(
-                    symbol, type="market", side="buy", amount=amount, price=price
-                )
             except Exception:
                 raise
         raise last_error
@@ -178,6 +206,10 @@ class MexcExchange:
             logger.info(f"[DRY_RUN] TRIGGER SELL {amount} {symbol} @ trigger={trigger_price}")
             return {"id": "dry-run", "symbol": symbol, "side": "sell", "amount": amount,
                     "status": "dry_run", "info": {"triggerPrice": trigger_price}}
+        # تقريب الكمية لدقة المنصة عشان ما يحصلش Oversold بسبب كسور صغيرة
+        amount = self.round_amount_for_market(symbol, amount)
+        if amount <= 0:
+            raise ValueError(f"كمية غير صالحة بعد التقريب: {amount}")
         # كل trigger order لازم يكون مستقل (ccxt بيرفض أكتر من trigger في أمر واحد)
         return self.client.create_order(
             symbol, type="market", side="sell", amount=amount,

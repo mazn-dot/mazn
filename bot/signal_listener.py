@@ -149,16 +149,29 @@ class SignalListener:
             _reject(f"الرصيد المتاح ({balance:.2f} USDT) أقل من المبلغ الثابت المحدد ({fixed_usdt} USDT)")
             return
 
-        total_amount = round(fixed_usdt / current_price, 6)
-        if total_amount <= 0:
-            _reject("كمية محسوبة غير صالحة (صفر)")
-            return
-
+        # ---- تنفيذ الشراء بمبلغ ثابت بالـ USDT (الطريقة الأضمن على MEXC) ----
         try:
-            self.exchange.create_market_buy(spot_symbol, total_amount)
+            order = self.exchange.create_market_buy(spot_symbol, cost=fixed_usdt)
+            logger.info(f"{spot_symbol}: أمر الشراء اتنفذ | order={order.get('id') if isinstance(order, dict) else order}")
         except Exception as e:
             _reject(f"فشل تنفيذ أمر الشراء: {e}")
             return
+
+        # استنى شوية عشان الرصيد يتحدث على المنصة، بعدين هات الكمية الفعلية
+        import time
+        time.sleep(1.8)
+        actual_amount = self.exchange.fetch_base_balance(spot_symbol)
+        if actual_amount is None or actual_amount <= 0:
+            # محاولة ثانية بعد انتظار إضافي
+            time.sleep(1.5)
+            actual_amount = self.exchange.fetch_base_balance(spot_symbol)
+
+        if actual_amount is None or actual_amount <= 0:
+            _reject(f"الشراء اتنفذ بس الرصيد الفعلي من العملة صفر أو غير متاح: {actual_amount}")
+            return
+
+        total_amount = round(float(actual_amount), 6)
+        logger.info(f"{spot_symbol}: الكمية الفعلية بعد الشراء = {total_amount}")
 
         # ---- تقسيم الكمية على 3 أهداف بالظبط (بغض النظر عن عدد أهداف التوصية) ----
         three_targets = normalize_to_three_targets(current_price, parsed.targets)
