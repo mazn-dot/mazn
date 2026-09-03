@@ -71,6 +71,54 @@ def _check_open_trade_exit(exchange, db, risk, telegram, trade: dict, current_pr
         logger.warning(f"{symbol}: كمية غير صالحة للبيع عند القفل، تم التجاهل.")
         return False
 
+    # لو ستوب لوس: نلغي أوامر Limit TP أولاً عشان الرصيد يتحرر، بعدين نبيع Market
+    if hit_sl and not shared_state.is_dry_run():
+        try:
+            exchange.cancel_all_open_orders(symbol)
+            import time as _t
+            _t.sleep(0.8)
+            available = exchange.fetch_base_balance(symbol)
+            if available and available > 0:
+                amount = min(amount, available)
+        except Exception as e:
+            logger.warning(f"{symbol}: تعذر إلغاء الأوامر قبل البيع عند الستوب: {e}")
+
+    # لو تيك بروفيت: الأمر Limit ممكن يكون اتنفذ بالفعل على المنصة → لو الرصيد قليل متبعش تاني
+    if hit_tp and not shared_state.is_dry_run():
+        available = exchange.fetch_base_balance(symbol)
+        if available is not None and available < amount * 0.5:
+            # الأمر اتنفذ أصلاً على المنصة — نقفل السجل بس
+            pnl_usdt = (current_price - entry) * amount
+            db.close_trade(trade["id"], current_price, pnl_usdt)
+            balance = exchange.fetch_balance_usdt()
+            risk.register_trade_result(pnl_usdt, balance)
+            _cancel_trade_plan_orders(exchange, db, symbol, trade)
+            telegram.notify(
+                f"🎯 تيك بروفيت (Limit اتنفذ على المنصة) - تم قفل المركز #{trade['id']}\n"
+                f"{symbol} | دخول={entry:.6g} | خروج={current_price:.6g}\n"
+                f"الربح/الخسارة: {pnl_usdt:+.2f} USDT"
+            )
+            logger.info(f"{symbol}: TP Limit اتنفذ مسبقاً على المنصة #{trade['id']} | pnl={pnl_usdt:+.2f}")
+            # رفع الستوب للأجزاء الباقية
+            group_id = trade.get("group_id")
+            leg_index = trade.get("leg_index")
+            if group_id and leg_index:
+                if leg_index == 1:
+                    new_stop = entry
+                    stop_desc = "سعر الدخول (تعادل)"
+                else:
+                    new_stop = db.get_leg_take_profit(group_id, leg_index - 1)
+                    stop_desc = f"سعر الهدف {leg_index - 1}"
+                if new_stop is not None:
+                    db.raise_group_stop_loss(group_id, exclude_trade_id=trade["id"], new_stop=new_stop)
+                    logger.info(f"{symbol}: تم رفع الستوب لوس للأجزاء الباقية إلى {new_stop:.6g} ({stop_desc})")
+                    telegram.notify(
+                        f"🔧 تم رفع الستوب لوس للأجزاء الباقية من {symbol}\n"
+                        f"القيمة الجديدة: {new_stop:.6g} ({stop_desc})"
+                    )
+                    _sync_group_sl_on_platform(exchange, db, symbol, group_id, trade["id"], new_stop)
+            return True
+
     exchange.create_market_sell(symbol, amount)
     pnl_usdt = (current_price - entry) * amount
     db.close_trade(trade["id"], current_price, pnl_usdt)
@@ -115,50 +163,41 @@ def _check_open_trade_exit(exchange, db, risk, telegram, trade: dict, current_pr
 
 
 def _cancel_trade_plan_orders(exchange, db, symbol: str, trade: dict):
-    """يلغي أوامر المنصة الشرطية المرتبطة بصفقة اتقفلت (أمر TP للـ leg + أمر SL المشترك)."""
+    """يلغي أوامر Limit TP المرتبطة بصفقة اتقفلت (لما الستوب يضرب أو الهدف اتحقق)."""
     group_id = trade.get("group_id")
     if not group_id:
+        # حتى لو مفيش group، حاول تلغي أي أوامر مفتوحة على الرمز لو الستوب ضرب
+        try:
+            exchange.cancel_all_open_orders(symbol)
+        except Exception:
+            pass
         return
     try:
         cancelled = set()
         for row in db.get_group_plan_order_ids(group_id):
             for oid in (row["plan_order_ids"] or []) or []:
                 if oid and oid not in cancelled:
-                    exchange.cancel_plan_order(symbol, oid)
+                    exchange.cancel_order(symbol, oid)
                     cancelled.add(oid)
-        # أمر SL المشترك (بيتسجل مع أكتر من leg - يُلغى مرة واحدة بس)
-        for row in db.get_group_plan_order_ids(group_id):
-            oid = row.get("sl_plan_order_id")
-            if oid and oid not in cancelled:
-                exchange.cancel_plan_order(symbol, oid)
-                cancelled.add(oid)
+        # مفيش SL على المنصة أصلاً (Limit TP بيحجز الرصيد)
+        if cancelled:
+            logger.info(f"{symbol}: تم إلغاء {len(cancelled)} أمر Limit بعد قفل الصفقة #{trade['id']}")
     except Exception as e:
         logger.warning(f"{symbol}: فشل إلغاء أوامر المنصة للصفقة #{trade['id']}: {e}")
+        # احتياطي: إلغاء كل الأوامر المفتوحة على الرمز
+        try:
+            exchange.cancel_all_open_orders(symbol)
+        except Exception:
+            pass
 
 
 def _sync_group_sl_on_platform(exchange, db, symbol: str, group_id: str, exclude_trade_id: int, new_stop: float):
-    """بعد رفع الستوب في قاعدة البيانات، يحط أمر SL جديد على المنصة بالستوب الجديد
-    على الكمية المتبقية الفعلية في المحفظة، ويربطه بصفقة group.
-    ملاحظة: كل أمر من المنصة بيرجع بـ status مختلف، فبنحفظه مع أول صفقات المجموعة المفتوحة."""
-    try:
-        # حساب الكمية المتبقية: كل الـ legs المفتوحة الباقية
-        remaining = 0.0
-        remaining_trade_id = None
-        for t in db.open_trades():
-            if t.get("group_id") == group_id and t["id"] != exclude_trade_id:
-                remaining += float(t["amount"])
-                remaining_trade_id = remaining_trade_id or t["id"]
-        if remaining <= 0 or remaining_trade_id is None:
-            return
-        order, errors = exchange.replace_sl_order(symbol, None, new_stop, round(remaining, 6))
-        order_id = order.get("id") if isinstance(order, dict) else getattr(order, "id", None)
-        if order_id:
-            db.save_plan_order_ids(remaining_trade_id, [], str(order_id))
-            logger.info(f"{symbol}: تم تحديث أمر SL على المنصة إلى {new_stop:.6g} للكمية {remaining:.6g}")
-        if errors:
-            logger.warning(f"{symbol}: مشاكل جزئية عند تحديث أمر SL: {errors}")
-    except Exception as e:
-        logger.error(f"{symbol}: فشل تحديث أمر SL على المنصة: {e}")
+    """بعد رفع الستوب في قاعدة البيانات — مفيش أمر SL على المنصة (Limit TP بيحجز الرصيد).
+    الستوب بيبقى داخلي فقط في البوت."""
+    logger.info(
+        f"{symbol}: تم رفع الستوب الداخلي للمجموعة إلى {new_stop:.6g} "
+        "(مفيش أمر SL على المنصة — الحماية داخلية فقط)"
+    )
 
 
 def run():

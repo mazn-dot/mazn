@@ -192,93 +192,109 @@ class MexcExchange:
         return self.create_market_sell(symbol, amount)
 
     # =========================================================================
-    # أوامر TP/SL على المنصة نفسها (trigger / plan orders) - طبقة حماية خارجية
-    # MEXC Spot يدعم أوامر شرطية عبر triggerPrice في ccxt.
-    # كل هدف وكل ستوب أمر مستقل.
+    # أوامر TP على المنصة = Limit Sell عادي (اللي MEXC Spot بيدعمه كويس)
+    # الستوب لوس يفضل بالمراقبة الداخلية في البوت فقط (لأن Limit TP بيحجز الرصيد).
     # =========================================================================
-    def create_trigger_sell(self, symbol: str, amount: float, trigger_price: float):
+    def round_price(self, symbol: str, price: float) -> float:
+        """تقريب السعر لدقة المنصة."""
+        try:
+            market = self.client.markets.get(symbol)
+            if not market:
+                self.client.load_markets()
+                market = self.client.markets.get(symbol) or {}
+            precision = market.get("precision", {}).get("price")
+            if precision is not None:
+                return round(float(price), int(precision) if isinstance(precision, (int, float)) and precision < 20 else 8)
+        except Exception:
+            pass
+        return float(price)
+
+    def create_limit_sell(self, symbol: str, amount: float, price: float):
         """
-        أمر بيع ماركت شرطى (trigger order) على المنصة: يُفعّل تلقائيًا لما السعر
-        يوصل trigger_price. بيتستخدم للـ TP (عند الهدف) والـ SL (عند الستوب).
-        في Dry Run بيسجل في اللوج بس ومش بينفذ حاجة على المنصة.
+        أمر بيع Limit عادي عند سعر الهدف (تيك بروفيت).
+        ده الطريقة المضمونة على MEXC Spot — مش Trigger.
         """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] TRIGGER SELL {amount} {symbol} @ trigger={trigger_price}")
-            return {"id": "dry-run", "symbol": symbol, "side": "sell", "amount": amount,
-                    "status": "dry_run", "info": {"triggerPrice": trigger_price}}
-        # تقريب الكمية لدقة المنصة عشان ما يحصلش Oversold بسبب كسور صغيرة
+            logger.info(f"[DRY_RUN] LIMIT SELL {amount} {symbol} @ {price}")
+            return {
+                "id": "dry-run",
+                "symbol": symbol,
+                "side": "sell",
+                "type": "limit",
+                "amount": amount,
+                "price": price,
+                "status": "dry_run",
+            }
         amount = self.round_amount_for_market(symbol, amount)
+        price = self.round_price(symbol, price)
         if amount <= 0:
             raise ValueError(f"كمية غير صالحة بعد التقريب: {amount}")
-        # كل trigger order لازم يكون مستقل (ccxt بيرفض أكتر من trigger في أمر واحد)
-        return self.client.create_order(
-            symbol, type="market", side="sell", amount=amount,
-            params={"triggerPrice": trigger_price}
+        if price <= 0:
+            raise ValueError(f"سعر غير صالح: {price}")
+        order = self.client.create_order(
+            symbol, type="limit", side="sell", amount=amount, price=price
         )
+        logger.info(f"{symbol}: LIMIT SELL (TP) amount={amount} @ {price} | id={order.get('id')}")
+        return order
 
     def place_tp_sl_orders(self, symbol: str, legs: list[tuple[float, float]], sl: float | None):
         """
-        يضع أوامر TP لكل leg (الكمية الجزئية عند كل هدف) + أمر SL واحد بالكمية الكلية.
-        بيرجع dict فيه نتائج التنفيذ لكل أمر - الأخطاء مش بتقفل الشراء (حماية احتياطية):
-        - لو فشل أمر المنصة، المراقبة الذاتية في البوت بتغطي القفل.
+        يضع أوامر Limit Sell (تيك بروفيت) لكل جزء عند سعر الهدف.
+        الستوب لوس **مش** بيتحط على المنصة (Limit TP بيحجز الرصيد كله)،
+        الحماية الداخلية في البوت هي اللي بتبيع الباقي لما الستوب يضرب.
         """
         results = {"tp": [], "sl": None, "errors": []}
         total_amount = sum(a for a, _ in legs)
 
         for leg_amount, target in legs:
             try:
-                order = self.create_trigger_sell(symbol, leg_amount, target)
+                order = self.create_limit_sell(symbol, leg_amount, target)
                 order_id = order.get("id") if isinstance(order, dict) else getattr(order, "id", None)
                 results["tp"].append({"target": target, "amount": leg_amount, "order_id": order_id})
-                logger.info(f"{symbol}: تم وضع أمر TP على المنصة - target={target} amount={leg_amount} id={order_id}")
+                logger.info(f"{symbol}: تم وضع أمر TP (Limit) على المنصة - target={target} amount={leg_amount} id={order_id}")
             except Exception as e:
                 results["errors"].append(f"TP@{target}: {e}")
                 logger.error(f"{symbol}: فشل وضع أمر TP عند {target}: {e}")
 
-        # ملاحظة مهمة: أوامر الـ Trigger على MEXC بتحجز الرصيد.
-        # لو حطينا 3 أوامر TP بالكمية كاملة + أمر SL بنفس الكمية → Oversold.
-        # لذلك بنحط أوامر الـ TP فقط على المنصة، والـ SL بيتحمى بالمراقبة الداخلية في البوت.
+        # الستوب لوس داخلي فقط — Limit TP بيحجز الكمية فلازم ما نحطش SL على المنصة
         if sl is not None and total_amount > 0:
             logger.info(
                 f"{symbol}: تم تخطي أمر SL على المنصة (stop={sl}) "
-                "عشان أوامر الـ TP حجزت الرصيد — الحماية الداخلية شغالة."
+                "— أوامر Limit TP حجزت الرصيد. الحماية الداخلية شغالة."
             )
             results["sl"] = {"stop": sl, "amount": total_amount, "order_id": None, "skipped": True}
 
         return results
 
-    def fetch_open_plan_orders(self, symbol: str):
-        """جلب الأوامر الشرطية (plan/trigger orders) المفتوحة - مفيد للتشخيص والإلغاء."""
+    def fetch_open_orders(self, symbol: str = None):
+        """جلب الأوامر المفتوحة (Limit) على الرمز."""
         try:
-            # بعض المنصات تحتاج params إضافية للأوامر الشرطية
-            return self.client.fetch_open_orders(symbol, params={"stop": True})
+            return self.client.fetch_open_orders(symbol)
         except Exception as e:
-            logger.error(f"{symbol}: فشل جلب الأوامر الشرطية: {e}")
+            logger.error(f"{symbol}: فشل جلب الأوامر المفتوحة: {e}")
             return []
 
-    def cancel_plan_order(self, symbol: str, order_id: str):
-        """إلغاء أمر شرطي (مثلاً SL لما اتباعت أجزاء منه بالفعل)."""
+    def cancel_order(self, symbol: str, order_id: str):
+        """إلغاء أمر Limit (لما الستوب يضرب أو نحتاج نلغي الباقي)."""
         try:
             if self.dry_run:
-                logger.info(f"[DRY_RUN] CANCEL PLAN ORDER {order_id}")
+                logger.info(f"[DRY_RUN] CANCEL ORDER {order_id}")
                 return {"id": order_id, "status": "dry_run"}
             return self.client.cancel_order(order_id, symbol)
         except Exception as e:
             logger.error(f"{symbol}: فشل إلغاء الأمر {order_id}: {e}")
             return None
 
-    def replace_sl_order(self, symbol: str, old_order_id: str, new_stop: float, total_amount: float):
-        """لما الستوب يتحرك (trailing): يلغي أمر SL القديمة ويضع واحد جديد بسعر الستوب الجديد."""
-        errors = []
-        if old_order_id:
-            try:
-                self.cancel_plan_order(symbol, old_order_id)
-            except Exception as e:
-                errors.append(f"cancel SL: {e}")
-        new_order = None
+    def cancel_all_open_orders(self, symbol: str):
+        """يلغي كل الأوامر المفتوحة على الرمز (مفيد لما الستوب يضرب)."""
+        cancelled = []
         try:
-            new_order = self.create_trigger_sell(symbol, total_amount, new_stop)
+            opens = self.fetch_open_orders(symbol)
+            for o in opens:
+                oid = o.get("id")
+                if oid:
+                    self.cancel_order(symbol, oid)
+                    cancelled.append(oid)
         except Exception as e:
-            errors.append(f"new SL: {e}")
-            logger.error(f"{symbol}: فشل وضع أمر SL الجديد عند {new_stop}: {e}")
-        return new_order, errors
+            logger.error(f"{symbol}: فشل إلغاء الأوامر المفتوحة: {e}")
+        return cancelled

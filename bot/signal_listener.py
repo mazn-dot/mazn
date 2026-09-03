@@ -149,6 +149,15 @@ class SignalListener:
             _reject(f"الرصيد المتاح ({balance:.2f} USDT) أقل من المبلغ الثابت المحدد ({fixed_usdt} USDT)")
             return
 
+        # ---- تسجيل رصيد العملة قبل الشراء (عشان نفصل كمية التوصية عن أي رصيد قديم) ----
+        balance_before = 0.0
+        if not shared_state.is_dry_run():
+            try:
+                balance_before = float(self.exchange.fetch_base_balance(spot_symbol) or 0)
+            except Exception:
+                balance_before = 0.0
+            logger.info(f"{spot_symbol}: رصيد العملة قبل الشراء = {balance_before}")
+
         # ---- تنفيذ الشراء بمبلغ ثابت بالـ USDT (الطريقة الأضمن على MEXC) ----
         try:
             order = self.exchange.create_market_buy(spot_symbol, cost=fixed_usdt)
@@ -160,55 +169,55 @@ class SignalListener:
         import time
         expected_amount = round(fixed_usdt / current_price, 6)
         if shared_state.is_dry_run():
-            # في وضع التجربة: نحسب الكمية المتوقعة من السعر (مش نجيب رصيد حقيقي = dust)
             total_amount = expected_amount
             logger.info(f"{spot_symbol}: [DRY_RUN] كمية متوقعة = {total_amount} (من {fixed_usdt} USDT @ {current_price})")
         else:
-            # تداول حقيقي: جرب نطلع الكمية من رد الأمر، وإلا من رصيد المحفظة
+            # 1) أولوية: الكمية المعبأة من رد الأمر
             filled = None
             if isinstance(order, dict):
-                filled = order.get("filled") or order.get("amount")
-                if filled is not None:
-                    try:
-                        filled = float(filled)
-                    except (TypeError, ValueError):
-                        filled = None
+                for key in ("filled", "amount"):
+                    val = order.get(key)
+                    if val is not None:
+                        try:
+                            filled = float(val)
+                            if filled > 0:
+                                break
+                        except (TypeError, ValueError):
+                            filled = None
 
+            # 2) فرق الرصيد بعد الشراء = كمية التوصية فقط (منفصلة عن أي رصيد قديم)
             time.sleep(1.5)
-            actual_amount = self.exchange.fetch_base_balance(spot_symbol)
-            if actual_amount is None or actual_amount <= 0:
+            balance_after = float(self.exchange.fetch_base_balance(spot_symbol) or 0)
+            if balance_after <= 0:
                 time.sleep(1.5)
-                actual_amount = self.exchange.fetch_base_balance(spot_symbol)
+                balance_after = float(self.exchange.fetch_base_balance(spot_symbol) or 0)
+            delta = max(0.0, balance_after - balance_before)
 
-            # نختار أفضل تقدير: filled من الأمر > رصيد المحفظة > الكمية المتوقعة
-            candidates = []
+            chosen_name = "expected"
+            total_amount = expected_amount
             if filled and filled > 0:
-                candidates.append(("order_filled", filled))
-            if actual_amount and actual_amount > 0:
-                candidates.append(("wallet", float(actual_amount)))
-            candidates.append(("expected", expected_amount))
+                chosen_name, total_amount = "order_filled", filled
+            elif delta > 0:
+                chosen_name, total_amount = "wallet_delta", delta
 
-            # لو الرصيد أكبر بكتير من المتوقع (كان فيه رصيد قديم)، استخدم المتوقع أو filled
-            chosen_name, total_amount = candidates[0]
-            if chosen_name == "wallet" and expected_amount > 0:
-                # لو الرصيد أكبر من المتوقع بـ 30%+ يبقى فيه dust قديم → استخدم المتوقع أو filled
-                if total_amount > expected_amount * 1.3 and filled and filled > 0:
-                    chosen_name, total_amount = "order_filled", filled
-                elif total_amount > expected_amount * 1.3:
-                    chosen_name, total_amount = "expected", expected_amount
-                # لو الرصيد أصغر بكتير من المتوقع (شراء جزئي) استخدم الرصيد الفعلي
-                elif total_amount < expected_amount * 0.5:
-                    logger.warning(
-                        f"{spot_symbol}: الرصيد الفعلي ({total_amount}) أقل من المتوقع ({expected_amount}) — شراء جزئي؟"
-                    )
+            # حماية: عمرنا ما نستخدم أكتر من المتوقع + هامش صغير (انزلاق/رسوم)
+            max_allowed = expected_amount * 1.15 if expected_amount > 0 else total_amount
+            if total_amount > max_allowed and max_allowed > 0:
+                logger.warning(
+                    f"{spot_symbol}: الكمية ({total_amount}) أكبر من المتوقع ({expected_amount}) "
+                    f"— تم تقييدها إلى {max_allowed} (حماية من الرصيد القديم)"
+                )
+                total_amount = max_allowed
+                chosen_name = chosen_name + "+capped"
 
             total_amount = round(float(total_amount), 6)
             if total_amount <= 0:
                 _reject(f"كمية غير صالحة بعد الشراء: {total_amount}")
                 return
             logger.info(
-                f"{spot_symbol}: كمية مستخدمة = {total_amount} "
-                f"(مصدر={chosen_name}, متوقع={expected_amount}, محفظة={actual_amount}, filled={filled})"
+                f"{spot_symbol}: كمية التوصية فقط = {total_amount} "
+                f"(مصدر={chosen_name} | متوقع={expected_amount} | "
+                f"قبل={balance_before} | بعد={balance_after} | فرق={delta} | filled={filled})"
             )
 
         # ---- تقسيم الكمية على 3 أهداف بالظبط (بغض النظر عن عدد أهداف التوصية) ----
