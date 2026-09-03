@@ -158,25 +158,15 @@ class MexcExchange:
         raise last_error
 
     def round_amount_for_market(self, symbol: str, amount: float) -> float:
-        """يقرب الكمية لأدق دقة مقبولة من المنصة عشان ما ترفضها (مثلاً MEXC
-        يرفض كميات أدق من الحد الأدنى للدقة).
-        بيرجع الكمية مربعة لأسفل (مش بتزيد الكمية عن المتاحة أبدًا)."""
+        """يقرب الكمية لدقة المنصة باستخدام ccxt (يتعامل مع tick size صح)."""
         try:
-            market = self.client.markets.get(symbol)
-            precision = None
-            if market:
-                precision = market.get("precision", {}).get("amount")
-            if precision is None:
+            if not self.client.markets:
                 self.client.load_markets()
-                market = self.client.markets.get(symbol) or {}
-                precision = market.get("precision", {}).get("amount")
-            if precision is not None:
-                amount = round(int(amount * (10 ** precision)) / (10 ** precision), int(precision))
+            prec = self.client.amount_to_precision(symbol, float(amount))
+            return float(prec)
         except Exception as e:
-            logger.warning(f"{symbol}: تعذر تحديد دقة الكمية، استخدمت الكمية كما هي: {e}")
-        # الحد الأدنى: لو قربنا الكمية نزلت لصفر، نرجع القيمة الأصلية عشان
-        # المنصة هي اللي ترفض وتوضح السبب (أفضل من تجارة صفر)
-        return amount if amount > 0 else amount
+            logger.warning(f"{symbol}: تعذر تقريب الكمية عبر ccxt ({e}) — استخدام القيمة كما هي")
+            return float(amount)
 
     def create_market_sell(self, symbol: str, amount: float):
         """بيع سبوت بسعر السوق - amount بالعملة الأساسية (base currency).
@@ -196,18 +186,16 @@ class MexcExchange:
     # الستوب لوس يفضل بالمراقبة الداخلية في البوت فقط (لأن Limit TP بيحجز الرصيد).
     # =========================================================================
     def round_price(self, symbol: str, price: float) -> float:
-        """تقريب السعر لدقة المنصة."""
+        """تقريب السعر لدقة المنصة باستخدام ccxt (يتعامل مع tick size صح)."""
         try:
-            market = self.client.markets.get(symbol)
-            if not market:
+            if not self.client.markets:
                 self.client.load_markets()
-                market = self.client.markets.get(symbol) or {}
-            precision = market.get("precision", {}).get("price")
-            if precision is not None:
-                return round(float(price), int(precision) if isinstance(precision, (int, float)) and precision < 20 else 8)
-        except Exception:
-            pass
-        return float(price)
+            # price_to_precision بيرجع string مضبوط حسب tick size المنصة
+            prec = self.client.price_to_precision(symbol, float(price))
+            return float(prec)
+        except Exception as e:
+            logger.warning(f"{symbol}: تعذر تقريب السعر عبر ccxt ({e}) — استخدام القيمة كما هي")
+            return float(price)
 
     def create_limit_sell(self, symbol: str, amount: float, price: float):
         """
@@ -230,7 +218,7 @@ class MexcExchange:
         if amount <= 0:
             raise ValueError(f"كمية غير صالحة بعد التقريب: {amount}")
         if price <= 0:
-            raise ValueError(f"سعر غير صالح: {price}")
+            raise ValueError(f"سعر غير صالح بعد التقريب: {price} (الأصلي كان موجب؟)")
         order = self.client.create_order(
             symbol, type="limit", side="sell", amount=amount, price=price
         )
