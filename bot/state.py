@@ -28,11 +28,11 @@ DEFAULT_SETTINGS = {
     "market_type": "spot",            # ثابت على spot - البوت ده لتداول السبوت فقط
     "signal_channels": Config.signal_channels_list(),  # قابلة للتعديل لايف من تليجرام (بالإضافة لمتغير SIGNAL_CHANNELS الابتدائي)
     "max_daily_loss_pct": 3.0,
-    "max_open_positions": 2,
+    "max_open_positions": 10,
     "poll_interval_seconds": 15,
     # ---- إعدادات مراقبة قنوات التوصيات (Telethon) - المصدر الوحيد لفتح صفقات ----
     "signal_trading_enabled": True,     # تشغيل/إيقاف تنفيذ التوصيات من القنوات
-    "signal_trade_amount_usdt": 20.0,   # مبلغ ثابت (USDT) لكل توصية بيتم تنفيذها
+    "signal_trade_amount_usdt": 10.0,   # مبلغ ثابت (USDT) لكل توصية بيتم تنفيذها
     "signal_price_tolerance_pct": 3.0,  # لو السعر الحالي بعيد عن سعر الدخول المذكور بأكتر من كده، بتتجاهل التوصية (سعر قديم/متغير)
 }
 
