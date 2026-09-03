@@ -513,32 +513,94 @@ class TelegramController:
             return
         await self._do_closeall(update.message)
 
-    async def _do_closeall(self, message):
-        """بيع كل المراكز المفتوحة (السبوت) بسعر السوق وقفلها في قاعدة البيانات."""
-        trades = self.db.open_trades()
-        if not trades:
-            await message.reply_text("مفيش مراكز مفتوحة أصلاً.", reply_markup=self._kb_main())
-            return
+    async def _do_close_symbol(self, symbol: str) -> str:
+        """إغلاق مركز رمز واحد: إلغاء الطلبات المفتوحة + بيع Market + قفل السجل."""
+        trades = [t for t in self.db.open_trades() if t["symbol"] == symbol]
+        # حتى لو مفيش سجل: نبيع الرصيد الحر ونلغي الطلبات
+        try:
+            self.exchange.cancel_all_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"{symbol}: فشل إلغاء الطلبات: {e}")
+
+        import time as _t
+        _t.sleep(0.6)
+
+        available = 0.0
+        if not shared_state.is_dry_run():
+            try:
+                available = float(self.exchange.fetch_base_balance(symbol) or 0)
+            except Exception:
+                available = 0.0
+        else:
+            available = sum(float(t["amount"]) for t in trades)
+
+        if available <= 0 and not trades:
+            return f"📭 {symbol}: مفيش رصيد ولا سجل مفتوح."
+
+        amount = available
+        if trades and available > 0:
+            recorded = sum(float(t["amount"]) for t in trades)
+            # نبيع الأقل بين الرصيد الفعلي ومجموع السجل (ما نلمسش رصيد قديم زيادة)
+            amount = min(available, recorded) if recorded > 0 else available
+
+        current_price = 0.0
+        try:
+            current_price = self.exchange.fetch_last_price(symbol)
+        except Exception:
+            pass
+
+        if amount > 0:
+            try:
+                self.exchange.create_market_sell(symbol, amount)
+            except Exception as e:
+                return f"❌ {symbol}: فشل البيع بسعر السوق: {e}"
+
         closed = 0
+        total_pnl = 0.0
         for t in trades:
             try:
-                symbol = t["symbol"]
-                amount = float(t["amount"])
-                if not shared_state.is_dry_run():
-                    available = self.exchange.fetch_base_balance(symbol)
-                    amount = min(amount, available) if available > 0 else amount
-                if amount <= 0:
-                    continue
-                self.exchange.create_market_sell(symbol, amount)
-                current_price = self.exchange.fetch_last_price(symbol)
                 entry = float(t["entry_price"])
-                pnl_usdt = (current_price - entry) * amount
-                self.db.close_trade(t["id"], current_price, pnl_usdt)
-                self.risk.register_trade_result(pnl_usdt, self.exchange.fetch_balance_usdt())
+                leg_amt = float(t["amount"])
+                pnl = (current_price - entry) * leg_amt if current_price else 0.0
+                self.db.close_trade(t["id"], current_price or entry, pnl)
+                self.risk.register_trade_result(pnl, self.exchange.fetch_balance_usdt())
+                total_pnl += pnl
                 closed += 1
             except Exception as e:
-                logger.error(f"فشل إغلاق مركز: {e}")
-        await message.reply_text(f"✅ تم إغلاق {closed} مركز بأمر يدوي (بيع بسعر السوق).", reply_markup=self._kb_main())
+                logger.error(f"فشل قفل سجل #{t.get('id')}: {e}")
+
+        return (
+            f"✅ {symbol}: تم إلغاء الطلبات + بيع {amount:.6g} بسعر السوق "
+            f"({current_price:.6g}) | قُفل {closed} سجل | PnL={total_pnl:+.2f} USDT"
+        )
+
+    async def _do_closeall(self, message):
+        """بيع كل المراكز المفتوحة (السبوت) بسعر السوق + إلغاء الطلبات وقفل السجل."""
+        trades = self.db.open_trades()
+        symbols = sorted({t["symbol"] for t in trades})
+        if not symbols:
+            # كمان نحاول نلغي أي طلبات مفتوحة عامة لو موجودة
+            await message.reply_text("مفيش مراكز مفتوحة مسجلة.", reply_markup=self._kb_main())
+            return
+        results = []
+        for symbol in symbols:
+            try:
+                msg = await self._do_close_symbol(symbol)
+                results.append(msg)
+            except Exception as e:
+                results.append(f"❌ {symbol}: {e}")
+                logger.error(f"فشل إغلاق {symbol}: {e}")
+        await message.reply_text("\n".join(results), reply_markup=self._kb_main())
+
+    def _kb_positions_close(self, symbols: list[str]) -> InlineKeyboardMarkup:
+        """أزرار إغلاق فردي لكل رمز + رجوع."""
+        rows = [
+            [InlineKeyboardButton(f"🛑 إغلاق {s} (سوق + حذف طلبات)", callback_data=f"act:close_sym:{s}")]
+            for s in symbols
+        ]
+        rows.append([InlineKeyboardButton("🚨 إغلاق الكل", callback_data="act:closeall_ask")])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:main")])
+        return InlineKeyboardMarkup(rows)
 
     # =========================================================================
     # هاندلر الأزرار (Callback Query) - المحرك الرئيسي للوحة التحكم
@@ -565,7 +627,15 @@ class TelegramController:
                 bal = self.exchange.fetch_balance_usdt()
                 await query.edit_message_text(f"💰 الرصيد المتاح: {bal:.2f} USDT", reply_markup=self._kb_back())
             elif data == "menu:positions":
-                await query.edit_message_text(await self._text_positions(), reply_markup=self._kb_back())
+                text = await self._text_positions()
+                open_syms = sorted({t["symbol"] for t in self.db.open_trades()})
+                if open_syms:
+                    await query.edit_message_text(
+                        text + "\n\nاختر رمز للإغلاق الفردي (بيع سوق + حذف الطلبات):",
+                        reply_markup=self._kb_positions_close(open_syms),
+                    )
+                else:
+                    await query.edit_message_text(text, reply_markup=self._kb_back())
             elif data == "menu:trades":
                 await query.edit_message_text(await self._text_trades(), reply_markup=self._kb_back())
             elif data == "menu:pnl":
@@ -650,12 +720,17 @@ class TelegramController:
                     )
             elif data == "act:closeall_ask":
                 await query.edit_message_text(
-                    "⚠️ الأمر ده هيقفل كل المراكز المفتوحة فوراً بسعر السوق.\nمتأكد؟",
+                    "⚠️ الأمر ده هيقفل كل المراكز المفتوحة فوراً بسعر السوق + يحذف الطلبات.\nمتأكد؟",
                     reply_markup=self._kb_closeall_confirm(),
                 )
             elif data == "act:closeall_yes":
-                await query.edit_message_text("⏳ جاري إغلاق كل المراكز...")
+                await query.edit_message_text("⏳ جاري إغلاق كل المراكز وحذف الطلبات...")
                 await self._do_closeall(query.message)
+            elif data.startswith("act:close_sym:"):
+                symbol = data.split("act:close_sym:", 1)[1].strip()
+                await query.edit_message_text(f"⏳ جاري إغلاق {symbol} وحذف الطلبات...")
+                result = await self._do_close_symbol(symbol)
+                await query.edit_message_text(result, reply_markup=self._kb_main())
             else:
                 await query.answer()
         except Exception as e:
