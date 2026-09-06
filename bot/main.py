@@ -248,6 +248,34 @@ def run():
             for t in open_trades:
                 open_by_symbol.setdefault(t["symbol"], []).append(t)
 
+            # ---- اكتشاف البيع الخارجي: لو الرصيد اختفى من المحفظة → اقفل السجل فوراً ----
+            for symbol, trades_for_symbol in list(open_by_symbol.items()):
+                try:
+                    bal = float(exchange.fetch_base_balance(symbol) or 0)
+                except Exception:
+                    continue
+                if bal > 1e-8:
+                    continue
+                try:
+                    price = exchange.fetch_last_price(symbol)
+                except Exception:
+                    price = float(trades_for_symbol[0]["entry_price"])
+                for trade in list(trades_for_symbol):
+                    try:
+                        entry = float(trade["entry_price"])
+                        amt = float(trade["amount"])
+                        pnl = (price - entry) * amt
+                        db.close_trade(trade["id"], price, pnl)
+                        logger.info(f"{symbol}: بيع خارجي مكتشف — قُفل السجل #{trade['id']} PnL={pnl:+.2f}")
+                    except Exception as e:
+                        logger.error(f"{symbol}: فشل قفل صفقة خارجية #{trade.get('id')}: {e}")
+                telegram.notify(
+                    f"🧹 بيع خارجي\n"
+                    f"الرمز {symbol} اتباع من برّا البوت.\n"
+                    f"تم حذف المركز من قاعدة البيانات تلقائياً."
+                )
+                open_by_symbol.pop(symbol, None)
+
             # ---- مراقبة كل مركز مفتوح (بيع عند SL/TP) ----
             for symbol, trades_for_symbol in open_by_symbol.items():
                 if _sell_error_counts.get(symbol, 0) >= _SELL_ERROR_LIMIT:

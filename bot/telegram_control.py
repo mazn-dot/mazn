@@ -108,20 +108,13 @@ class TelegramController:
     # =========================================================================
     def _kb_main(self) -> InlineKeyboardMarkup:
         s = shared_state.get_all()
-        pause_btn = ("▶️ استئناف التداول", "act:resume") if s["paused"] else ("⏸ إيقاف صفقات جديدة", "act:pause")
-        dry_btn = ("💰 تفعيل تداول حقيقي", "act:dryrun_off") if s["dry_run"] else ("🧪 تفعيل وضع تجربة", "act:dryrun_on")
-        signal_btn = ("📡 إيقاف توصيات القنوات", "act:signals_off") if s["signal_trading_enabled"] else ("📡 تفعيل توصيات القنوات", "act:signals_on")
+        dry_btn = ("💰 تداول حقيقي", "act:dryrun_off") if s["dry_run"] else ("🧪 وضع تجربة", "act:dryrun_on")
         rows = [
-            [InlineKeyboardButton("⚙️ الحالة", callback_data="menu:status"),
-             InlineKeyboardButton("🛠 الإعدادات", callback_data="menu:settings_view")],
-            [InlineKeyboardButton("💰 الرصيد", callback_data="menu:balance"),
-             InlineKeyboardButton("📌 المراكز المفتوحة", callback_data="menu:positions")],
-            [InlineKeyboardButton("📜 آخر الصفقات", callback_data="menu:trades"),
-             InlineKeyboardButton("📊 أداء اليوم", callback_data="menu:pnl")],
-            [InlineKeyboardButton(pause_btn[0], callback_data=pause_btn[1])],
+            [
+                InlineKeyboardButton("💰 الرصيد", callback_data="menu:balance"),
+                InlineKeyboardButton("📌 المراكز المفتوحة", callback_data="menu:positions"),
+            ],
             [InlineKeyboardButton(dry_btn[0], callback_data=dry_btn[1])],
-            [InlineKeyboardButton(signal_btn[0], callback_data=signal_btn[1])],
-            [InlineKeyboardButton("📡 آخر توصيات القنوات", callback_data="menu:channel_signals")],
             [InlineKeyboardButton("📺 إدارة قنوات التوصيات", callback_data="menu:channels")],
             [InlineKeyboardButton("🎛 ضبط الإعدادات العامة", callback_data="menu:strategy")],
             [InlineKeyboardButton("🚨 إغلاق كل المراكز", callback_data="act:closeall_ask")],
@@ -248,51 +241,105 @@ class TelegramController:
                                 "from_record": False})
         return matched
 
+    def _sync_external_sells(self) -> list[str]:
+        """أي صفقة مسجّلة open في قاعدة البيانات لكن رصيدها اختفى من المحفظة
+        (اتباعت برّا البوت) → تتقفل فوراً وتتحذف من المراكز المفتوحة."""
+        cleaned = []
+        trades = self.db.open_trades()
+        if not trades:
+            return cleaned
+        by_symbol: dict[str, list] = {}
+        for t in trades:
+            by_symbol.setdefault(t["symbol"], []).append(t)
+
+        for symbol, legs in by_symbol.items():
+            try:
+                bal = float(self.exchange.fetch_base_balance(symbol) or 0)
+            except Exception:
+                continue
+            # لو الرصيد شبه صفر → الصفقة اتباعت برّا
+            if bal <= 1e-8:
+                try:
+                    price = self.exchange.fetch_last_price(symbol)
+                except Exception:
+                    price = float(legs[0]["entry_price"])
+                for t in legs:
+                    try:
+                        entry = float(t["entry_price"])
+                        amt = float(t["amount"])
+                        pnl = (price - entry) * amt
+                        self.db.close_trade(t["id"], price, pnl)
+                        cleaned.append(symbol)
+                    except Exception as e:
+                        logger.error(f"فشل قفل صفقة خارجية #{t.get('id')}: {e}")
+        return cleaned
+
     async def _text_positions(self) -> str:
-        """يعرض فقط المراكز المفتوحة فعليًا في محفظة MEXC دلوقتي (مش السجل)،
-        بنسبة الربح/الخسارة غير المحققة بشكل مبسّط، ومدمجًا لكل عملة في سطر واحد."""
-        holdings = self._fetch_wallet_holdings()
-        if not holdings:
-            return "📭 محفظتك فاضية - لا توجد مراكز مفتوحة حاليًا."
+        """يعرض فقط المراكز اللي جت من توصيات القنوات (سجلات open في DB)
+        ومتبقّي لها رصيد فعلي — مش عملات المحفظة اليدوية."""
+        # نظّف أي صفقة اتباعت برّا البوت قبل العرض
+        cleaned = self._sync_external_sells()
 
         trades = self.db.open_trades()
-        matched = self._match_wallet_to_recorded(holdings, trades)
-        if not matched:
-            return "📭 لا توجد مراكز مفتوحة حاليًا."
+        if not trades:
+            extra = ""
+            if cleaned:
+                extra = f"\n\n🧹 تم حذف {len(set(cleaned))} مركز اتباع برّا البوت."
+            return "📭 لا توجد مراكز مفتوحة من التوصيات." + extra
+
+        # جمّع حسب الرمز
+        by_symbol: dict[str, list] = {}
+        for t in trades:
+            by_symbol.setdefault(t["symbol"], []).append(t)
 
         lines = []
         total_upnl = 0.0
-        for m in matched:
-            symbol = m["symbol"]
-            amount = m["amount"]
+        shown = 0
+        for symbol, legs in sorted(by_symbol.items()):
+            try:
+                bal = float(self.exchange.fetch_base_balance(symbol) or 0)
+            except Exception:
+                bal = 0.0
+            if bal <= 1e-8:
+                # اتباعت برّا — اتقفلت فوق؛ تخطّي
+                continue
+            recorded = sum(float(t["amount"]) for t in legs)
+            amount = min(bal, recorded) if recorded > 0 else bal
             if amount <= 0:
                 continue
             try:
                 current = self.exchange.fetch_last_price(symbol)
             except Exception:
-                lines.append(f"📌 {symbol} | كمية={amount:.6g} (تعذر جلب السعر الحالي)")
+                lines.append(f"📌 `{symbol}` | كمية={amount:.6g} (تعذر جلب السعر)")
+                shown += 1
                 continue
-            entry = m["entry"] if m["from_record"] else current
+            entry = sum(float(t["entry_price"]) * float(t["amount"]) for t in legs) / max(recorded, 1e-12)
             upnl = (current - entry) * amount
-            upnl_pct = ((current / entry) - 1) * 100 if m["from_record"] and entry else 0.0
+            upnl_pct = ((current / entry) - 1) * 100 if entry else 0.0
             total_upnl += upnl
-            sign = "📈" if upnl >= 0 else "📉"
-            mark = "" if m["from_record"] else " *(اشتريت يدويًا)*"
-            if m["from_record"]:
-                lines.append(
-                    f"{sign} {symbol}{mark}\n"
-                    f"   دخول: {entry:.6g} | الآن: {current:.6g} | الكمية: {amount:.6g}\n"
-                    f"   ⚡ غير محقق: {upnl:+.2f} USDT ({upnl_pct:+.2f}%)"
-                )
-            else:
-                lines.append(
-                    f"{sign} {symbol}{mark}\n"
-                    f"   الكمية: {amount:.6g} | الآن: {current:.6g} | غير محقق: {upnl:+.2f} USDT"
-                )
-        header = "📊 *المراكز المفتوحة في محفظتك حاليًا*"
+            sign = "🟢" if upnl >= 0 else "🔴"
+            tps = sorted({float(t["take_profit"]) for t in legs if t.get("take_profit")})
+            sl = legs[0].get("stop_loss")
+            tp_txt = " · ".join(f"{x:.6g}" for x in tps[:3]) if tps else "—"
+            lines.append(
+                f"{sign} *{symbol}*\n"
+                f"├ دخول: `{entry:.6g}`  │  الآن: `{current:.6g}`\n"
+                f"├ كمية: `{amount:.6g}`\n"
+                f"├ أهداف: `{tp_txt}`\n"
+                f"├ وقف: `{sl if sl else '—'}`\n"
+                f"└ PnL: `{upnl:+.2f}$` (`{upnl_pct:+.2f}%`)"
+            )
+            shown += 1
+
+        if shown == 0:
+            return "📭 لا توجد مراكز مفتوحة من التوصيات."
+
+        header = "📌 *المراكز المفتوحة (من التوصيات فقط)*"
         if total_upnl != 0.0:
-            header += f"\n💵 الإجمالي غير المحقق: {total_upnl:+.2f} USDT"
-        return header + "\n\n" + "\n".join(lines)
+            header += f"\n💵 الإجمالي غير المحقق: `{total_upnl:+.2f}` USDT"
+        if cleaned:
+            header += f"\n🧹 حُذف تلقائياً: {', '.join(sorted(set(cleaned)))}"
+        return header + "\n\n" + "\n\n".join(lines)
 
     async def _text_trades(self) -> str:
         trades = self.db.open_trades()
@@ -325,8 +372,15 @@ class TelegramController:
     async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
+        s = shared_state.get_all()
+        mode = "🧪 تجربة" if s["dry_run"] else "💰 حقيقي"
+        sig = "📡 مفعّل" if s.get("signal_trading_enabled", True) else "⏸ متوقف"
         await update.message.reply_text(
-            "🤖 *لوحة تحكم بوت توصيات القنوات*\nاختر من الأزرار تحت 👇",
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 *MEXC Spot — توصيات القنوات*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"الوضع: {mode}  ·  الإشارات: {sig}\n"
+            f"اختر من القائمة:",
             parse_mode="Markdown",
             reply_markup=self._kb_main(),
         )
@@ -615,51 +669,52 @@ class TelegramController:
         try:
             if data == "menu:main":
                 context.user_data.pop("awaiting", None)
+                s = shared_state.get_all()
+                mode = "🧪 تجربة" if s["dry_run"] else "💰 حقيقي"
+                sig = "📡 مفعّل" if s.get("signal_trading_enabled", True) else "⏸ متوقف"
                 await query.edit_message_text(
-                    "🤖 *لوحة تحكم بوت توصيات القنوات*\nاختر من الأزرار تحت 👇",
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🤖 *MEXC Spot — توصيات القنوات*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"الوضع: {mode}  ·  الإشارات: {sig}\n"
+                    f"اختر من القائمة:",
                     parse_mode="Markdown", reply_markup=self._kb_main(),
                 )
-            elif data == "menu:status":
-                await query.edit_message_text(self._text_status(), parse_mode="Markdown", reply_markup=self._kb_back())
-            elif data == "menu:settings_view":
-                await query.edit_message_text(self._text_settings(), parse_mode="Markdown", reply_markup=self._kb_back())
             elif data == "menu:balance":
                 bal = self.exchange.fetch_balance_usdt()
-                await query.edit_message_text(f"💰 الرصيد المتاح: {bal:.2f} USDT", reply_markup=self._kb_back())
+                await query.edit_message_text(
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 *الرصيد المتاح*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"`{bal:.2f}` USDT",
+                    parse_mode="Markdown",
+                    reply_markup=self._kb_back(),
+                )
             elif data == "menu:positions":
                 text = await self._text_positions()
                 open_syms = sorted({t["symbol"] for t in self.db.open_trades()})
-                if open_syms:
+                # تأكد إن الرصيد لسه موجود (مش بس سجل)
+                live_syms = []
+                for sym in open_syms:
+                    try:
+                        if float(self.exchange.fetch_base_balance(sym) or 0) > 1e-8:
+                            live_syms.append(sym)
+                    except Exception:
+                        pass
+                if live_syms:
                     await query.edit_message_text(
-                        text + "\n\nاختر رمز للإغلاق الفردي (بيع سوق + حذف الطلبات):",
-                        reply_markup=self._kb_positions_close(open_syms),
+                        text + "\n\n⬇️ اختر رمز للإغلاق الفردي:",
+                        parse_mode="Markdown",
+                        reply_markup=self._kb_positions_close(live_syms),
                     )
                 else:
-                    await query.edit_message_text(text, reply_markup=self._kb_back())
-            elif data == "menu:trades":
-                await query.edit_message_text(await self._text_trades(), reply_markup=self._kb_back())
-            elif data == "menu:pnl":
-                await query.edit_message_text(f"📊 أداء اليوم الحالي: {self.risk.daily_pnl_pct:.2f}%", reply_markup=self._kb_back())
-            elif data == "act:pause":
-                shared_state.set_paused(True)
-                await query.edit_message_text("⏸ تم إيقاف فتح صفقات جديدة.", reply_markup=self._kb_main())
-            elif data == "act:resume":
-                shared_state.set_paused(False)
-                await query.edit_message_text("▶️ تم استئناف التداول.", reply_markup=self._kb_main())
+                    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=self._kb_back())
             elif data == "act:dryrun_on":
                 shared_state.set_dry_run(True)
-                await query.edit_message_text("🧪 تم تفعيل وضع التجربة.", reply_markup=self._kb_main())
+                await query.edit_message_text("🧪 تم تفعيل *وضع التجربة* — مفيش أوامر حقيقية.", parse_mode="Markdown", reply_markup=self._kb_main())
             elif data == "act:dryrun_off":
                 shared_state.set_dry_run(False)
-                await query.edit_message_text("💰 تم تفعيل التداول الحقيقي.", reply_markup=self._kb_main())
-            elif data == "act:signals_on":
-                shared_state.set("signal_trading_enabled", True)
-                await query.edit_message_text("📡 تم تفعيل تنفيذ توصيات القنوات تلقائياً.", reply_markup=self._kb_main())
-            elif data == "act:signals_off":
-                shared_state.set("signal_trading_enabled", False)
-                await query.edit_message_text("📡 تم إيقاف تنفيذ توصيات القنوات (البوت هيفضل بس يراقب من غير تنفيذ).", reply_markup=self._kb_main())
-            elif data == "menu:channel_signals":
-                await query.edit_message_text(self._text_channel_signals(), parse_mode="Markdown", reply_markup=self._kb_back())
+                await query.edit_message_text("💰 تم تفعيل *التداول الحقيقي*.", parse_mode="Markdown", reply_markup=self._kb_main())
             elif data == "menu:channels":
                 channels = shared_state.get_signal_channels()
                 txt = "📺 *إدارة قنوات التوصيات*\nالقنوات الحالية:\n" + ("\n".join(f"• {c}" for c in channels) if channels else "(لا يوجد)")
