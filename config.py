@@ -2,14 +2,15 @@ import os
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TOP_N = 12
-MIN_TRANSFERS = 8
+TOP_N = 10
+MIN_TRANSFERS = 10
 
-# Continuous monitoring settings
-MONITOR_INTERVAL_SEC = 180          # كل 3 دقايق
-ALERT_COOLDOWN_SEC = 900            # متبعتش نفس التوكن تاني قبل 15 دقيقة
-MIN_WALLETS_FOR_ALERT = 3           # لازم 3 محافظ على الأقل سحبت
-MIN_SCORE_FOR_ALERT = 50000         # حد أدنى للسكور عشان الإشعار
+# Continuous monitoring (free-friendly)
+MONITOR_INTERVAL_SEC = 300          # كل 5 دقايق
+ALERT_COOLDOWN_SEC = 1200           # 20 دقيقة cooldown لنفس التوكن
+MIN_WALLETS_FOR_ALERT = 2           # محفظتين على الأقل
+MIN_SCORE_FOR_ALERT = 15000
+MAX_WALLETS_PER_CYCLE = 4           # يراقب 4 محافظ فقط في الدورة الواحدة (بالتناوب)
 
 DEFAULT_WALLETS = {
     "Bybit Hot 1": "0xf89d7b9c864f589bbF53a82105107622B35EaA40",
@@ -32,51 +33,28 @@ TIME_PERIODS = [
     ("ساعتان", 120),
     ("4 ساعات", 240),
     ("6 ساعات", 360),
-    ("8 ساعات", 480),
     ("12 ساعة", 720),
     ("24 ساعة", 1440),
 ]
 
-# 5 EVM chains — public RPCs (rate-limited, no API key)
+# Free-friendly chains only (most reliable public RPCs)
 CHAINS = {
     "bsc": {
         "name": "BSC",
-        "rpc": "https://rpc-bnb.blockmachine.io",
+        "rpc": "https://bsc-dataseed.binance.org",
+        "rpc_backup": "https://rpc-bnb.blockmachine.io",
         "dex": "bsc",
         "explorer": "https://bscscan.com",
         "native": "BNB",
         "blocks_per_min": 20,
     },
-    "ethereum": {
-        "name": "ETH",
-        "rpc": "https://eth.llamarpc.com",
-        "dex": "ethereum",
-        "explorer": "https://etherscan.io",
-        "native": "ETH",
-        "blocks_per_min": 5,
-    },
     "base": {
         "name": "Base",
         "rpc": "https://mainnet.base.org",
+        "rpc_backup": "https://base.llamarpc.com",
         "dex": "base",
         "explorer": "https://basescan.org",
         "native": "ETH",
-        "blocks_per_min": 30,
-    },
-    "arbitrum": {
-        "name": "ARB",
-        "rpc": "https://arb1.arbitrum.io/rpc",
-        "dex": "arbitrum",
-        "explorer": "https://arbiscan.io",
-        "native": "ETH",
-        "blocks_per_min": 15,
-    },
-    "polygon": {
-        "name": "Polygon",
-        "rpc": "https://polygon-rpc.com",
-        "dex": "polygon",
-        "explorer": "https://polygonscan.com",
-        "native": "MATIC",
         "blocks_per_min": 30,
     },
 }
