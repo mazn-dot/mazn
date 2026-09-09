@@ -3,26 +3,18 @@ import os
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TOP_N = 10
-MIN_TRANSFERS = 10
+MIN_TRANSFERS = 3
 
 # Continuous monitoring (free-friendly)
 MONITOR_INTERVAL_SEC = 300          # كل 5 دقايق
 ALERT_COOLDOWN_SEC = 1200           # 20 دقيقة cooldown لنفس التوكن
-MIN_WALLETS_FOR_ALERT = 2           # محفظتين على الأقل
-MIN_SCORE_FOR_ALERT = 15000
-MAX_WALLETS_PER_CYCLE = 4           # يراقب 4 محافظ فقط في الدورة الواحدة (بالتناوب)
+MIN_WALLETS_FOR_ALERT = 1           # محفظتين على الأقل
+MIN_SCORE_FOR_ALERT = 20000
+MAX_WALLETS_PER_CYCLE = 2           # يراقب 4 محافظ فقط في الدورة الواحدة (بالتناوب)
 
 DEFAULT_WALLETS = {
-    "Bybit Hot 1": "0xf89d7b9c864f589bbF53a82105107622B35EaA40",
-    "Bybit Hot 2": "0xA7A93fd0a276fc1C0197a5B5623eD117786eeD06",
-    "Bybit": "0xee5B5B923fFcE93A870B3104b7CA09c3db80047A",
-    "Whale A": "0x10b620f9720C0c6460484A81C59a6297Fa48F817",
-    "Whale B": "0xa1ab382330d6b7a99ee3441e6594e49790294e4e",
-    "Whale C": "0x1Db92e2EeBC8E0c075a02BeA49a2935BcD2dFCF4",
-    "Whale D": "0x88a1493366d48225fc3cefbdae9ebb23e323ade3",
-    "Whale E": "0x631fc1ea2270e98fbd9d92658ece0f5a269aa161",
-    "Whale F": "0xa9ac43f5b5e38155a288d1a01d2cbc4478e14573",
-    "Whale G": "0x53f78a071d04224b8e254e243fffc6d9f2f3fa23",
+    "MEXC 1": "0x9642b23ed1e01df1092b92641051881a322f5d4e",
+    "MEXC 2": "0x4982085c9e2f89f2ecb8131eca71afad896e89cb",
 }
 
 TIME_PERIODS = [

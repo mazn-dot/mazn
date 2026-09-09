@@ -29,23 +29,33 @@ def rpc(chain_id, method, params):
     if not cfg:
         return None
     now = time.time()
-    lock = _rpc_locks[chain_id]
+    lock = _rpc_locks.get(chain_id)
+    if lock is None:
+        return None
     with lock:
-        times = _rpc_times[chain_id]
+        times = _rpc_times.setdefault(chain_id, [])
         while times and times[0] < now - 60:
             times.pop(0)
-        if len(times) >= 40:
+        if len(times) >= 25:
             return None
         times.append(now)
-    try:
-        r = requests.post(
-            cfg["rpc"],
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=18,
-        )
-        return r.json().get("result") if r.status_code == 200 else None
-    except (requests.RequestException, ValueError, KeyError):
-        return None
+    urls = [cfg["rpc"]]
+    if cfg.get("rpc_backup"):
+        urls.append(cfg["rpc_backup"])
+    for url in urls:
+        try:
+            r = requests.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=12,
+            )
+            if r.status_code == 200:
+                result = r.json().get("result")
+                if result is not None:
+                    return result
+        except (requests.RequestException, ValueError, KeyError):
+            continue
+    return None
 
 
 def topic_address(address):
@@ -599,27 +609,47 @@ def get_usd_prices(items):
     return answer
 
 
+
 # ==================== Continuous Alert Logic ====================
+
+_cycle_index = 0
 
 def get_strong_outflow_alerts(minutes=30, wallets=None, chains=None):
     """
-    يبحث عن فرص سحب جماعي حقيقية:
-    - أكتر من محفظة بتسحب نفس التوكن
-    - سكور عالي
-    - تحويلات كافية
+    نسخة خفيفة مناسبة للـ Public RPCs:
+    - يراقب عدد محدود من المحافظ بالتناوب
+    - BSC + Base فقط
+    - شروط سحب جماعي
     """
-    from config import MIN_WALLETS_FOR_ALERT, MIN_SCORE_FOR_ALERT, MIN_TRANSFERS
+    global _cycle_index
+    from config import (
+        MIN_WALLETS_FOR_ALERT, MIN_SCORE_FOR_ALERT, MIN_TRANSFERS,
+        MAX_WALLETS_PER_CYCLE, ACTIVE_CHAINS
+    )
     if wallets is None:
         import wallets as wm
         wallets = wm.get_all()
     chains = chains or ACTIVE_CHAINS
 
-    # جمع الخروجات من كل محفظة
-    per_wallet = {}
-    for label, address in wallets.items():
-        per_wallet[label] = transfers_multi(address, "out", minutes, chains)
+    items = list(wallets.items())
+    if not items:
+        return []
 
-    # تجميع حسب التوكن + عدد المحافظ اللي سحبت
+    # تناوب على المحافظ عشان منضغطش على الـ RPC
+    n = len(items)
+    start = _cycle_index % n
+    selected = []
+    for i in range(min(MAX_WALLETS_PER_CYCLE, n)):
+        selected.append(items[(start + i) % n])
+    _cycle_index += MAX_WALLETS_PER_CYCLE
+
+    per_wallet = {}
+    for label, address in selected:
+        try:
+            per_wallet[label] = transfers_multi(address, "out", minutes, chains)
+        except Exception:
+            continue
+
     token_stats = {}
     for label, data in per_wallet.items():
         for ckey, info in data.items():
@@ -654,10 +684,8 @@ def get_strong_outflow_alerts(minutes=30, wallets=None, chains=None):
             continue
         st["wallet_count"] = n_wallets
         st["wallets"] = list(st["wallets"])
-        st["reason"] = "سحب جماعي من %d محافظ · %d تحويل · كمية %.0f" % (
-            n_wallets, st["count"], st["amount"]
-        )
+        st["reason"] = "سحب من MEXC (%d محفظة) · %d تحويل" % (n_wallets, st["count"])
         alerts.append(st)
 
     alerts.sort(key=lambda x: (x["wallet_count"], x["score"]), reverse=True)
-    return alerts[:8]
+    return alerts[:6]

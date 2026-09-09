@@ -257,12 +257,18 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result, reply_markup=main_keyboard(), **KW)
         return
 
-    # --- Add wallet (single or bulk) ---
-    if text.startswith("إضافة") or text.startswith("اضافه") or awaiting == "add_wallet":
+    # --- Add wallet (single, pure address, or bulk) ---
+    addrs_found = ADDR_RE.findall(text)
+    is_add_cmd = text.startswith("إضافة") or text.startswith("اضافه") or awaiting == "add_wallet"
+    clean = text.strip().replace(" ", "").replace("\n", "")
+    is_pure_address = len(addrs_found) == 1 and clean.lower().startswith("0x") and 40 <= len(clean) <= 42
+
+    if is_add_cmd or is_pure_address:
         context.user_data.pop("awaiting", None)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        # إذا في أكتر من سطر أو أكتر من عنوان → bulk
         addrs = ADDR_RE.findall(text)
+
+        # Bulk
         if len(lines) > 1 or len(addrs) > 1:
             success, errors = store.add_bulk(lines)
             msg = f"✅ تم إضافة <b>{success}</b> محفظة"
@@ -271,20 +277,24 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\n\n" + store.list_text()
             await update.message.reply_text(msg, reply_markup=main_keyboard(), **KW)
             return
-        # single
+
+        # Single (with name or pure address)
         m = ADDR_RE.search(text)
         if not m:
             await update.message.reply_text(
-                "❌ الصيغة:\n<code>إضافة اسم_المحفظة 0x...</code>\n"
-                "أو عدة أسطر للإضافة الجماعية:\n"
-                "<code>إضافة\nاسم1 0x...\nحوت اسم2 0x...</code>",
+                "❌ ابعت العنوان كده:\n<code>0x...</code>\n"
+                "أو:\n<code>إضافة اسم 0x...</code>",
                 **KW,
             )
             return
         address = m.group(0)
         before = text[: m.start()].strip()
         parts = before.replace("إضافة", "").replace("اضافه", "").replace("حوت", "").strip().split()
-        label = " ".join(parts) if parts else "حوت"
+        if parts:
+            label = " ".join(parts)
+        else:
+            # اسم تلقائي من آخر 4 حروف
+            label = "محفظة_" + address[-4:].upper()
         if "حوت" in text and not label.startswith("🐋"):
             label = "🐋 " + label
         err = store.add(label, address)
@@ -346,7 +356,7 @@ async def continuous_monitor(app):
     from tracker import get_strong_outflow_alerts
     import time
 
-    log.info("Continuous monitor started (interval=%ss)", MONITOR_INTERVAL_SEC)
+    log.info("Continuous monitor started FREE mode (interval=%ss, BSC+Base only)", MONITOR_INTERVAL_SEC)
     await asyncio.sleep(20)  # انتظار قصير بعد التشغيل
 
     while True:
@@ -389,7 +399,7 @@ async def continuous_monitor(app):
 
                 try:
                     await app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID or (await app.bot.get_me()).id,
+                        chat_id=TELEGRAM_CHAT_ID,
                         text=msg,
                         parse_mode="HTML",
                         disable_web_page_preview=False,
@@ -415,12 +425,12 @@ def main():
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
 
-    # تشغيل المراقبة المستمرة
-    async def post_init(application):
+    async def post_init(application: Application):
         application.create_task(continuous_monitor(application))
+        log.info("Continuous monitor task started")
 
     app.post_init = post_init
-    log.info("BNB wallet tracker started (v3 — continuous alerts + bulk add + strong filters)")
+    log.info("Wallet tracker FREE mode (BSC+Base only)")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
