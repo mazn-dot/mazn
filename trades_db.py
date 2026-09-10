@@ -1,9 +1,21 @@
 import sqlite3
 import os
 import time
+import json
 from contextlib import contextmanager
 
 DB = os.path.join(os.path.dirname(__file__), "trades.db")
+
+DEFAULT_SETTINGS = {
+    "trade_size_usd": 20.0,
+    "stop_loss_pct": -8.0,
+    "tp1_pct": 5.0,
+    "tp2_pct": 10.0,
+    "tp3_pct": 15.0,
+    "max_open_trades": 3,
+    "monitoring_enabled": False,
+    "auto_buy_enabled": False,
+}
 
 
 def _conn():
@@ -12,8 +24,18 @@ def _conn():
     return c
 
 
+@contextmanager
+def db():
+    c = _conn()
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
+
+
 def init():
-    with _conn() as c:
+    with db() as c:
         c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,18 +61,69 @@ def init():
             note TEXT
         )
         """)
-        c.commit()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        # seed defaults if empty
+        for k, v in DEFAULT_SETTINGS.items():
+            c.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (k, json.dumps(v)),
+            )
 
 
-@contextmanager
-def db():
-    c = _conn()
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+# ---------- Settings in DB ----------
 
+def get_setting(key, default=None):
+    init()
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if not row:
+            return DEFAULT_SETTINGS.get(key) if default is None else default
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return row["value"]
+
+
+def set_setting(key, value):
+    init()
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, json.dumps(value)),
+        )
+    return value
+
+
+def load_settings():
+    init()
+    out = dict(DEFAULT_SETTINGS)
+    with db() as c:
+        rows = c.execute("SELECT key, value FROM settings").fetchall()
+        for r in rows:
+            try:
+                out[r["key"]] = json.loads(r["value"])
+            except Exception:
+                out[r["key"]] = r["value"]
+    return out
+
+
+def save_settings(data: dict):
+    init()
+    with db() as c:
+        for k, v in data.items():
+            c.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (k, json.dumps(v)),
+            )
+    return load_settings()
+
+
+# ---------- Trades ----------
 
 def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
                stop_loss, tp1, tp2, tp3, note=""):
@@ -59,8 +132,8 @@ def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
         cur = c.execute(
             """INSERT INTO trades
             (symbol, contract, chain, entry_price, quantity, size_usd,
-             stop_loss, tp1, tp2, tp3, opened_at, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             stop_loss, tp1, tp2, tp3, opened_at, note, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open')""",
             (symbol, contract, chain, entry_price, quantity, size_usd,
              stop_loss, tp1, tp2, tp3, time.time(), note),
         )
@@ -70,7 +143,9 @@ def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
 def get_open_trades():
     init()
     with db() as c:
-        rows = c.execute("SELECT * FROM trades WHERE status='open' ORDER BY id").fetchall()
+        rows = c.execute(
+            "SELECT * FROM trades WHERE status='open' ORDER BY id"
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -86,16 +161,16 @@ def close_trade(trade_id, close_price, note=""):
             return None
         entry = row["entry_price"]
         pnl = ((close_price - entry) / entry) * 100 if entry else 0
+        old_note = row["note"] or ""
         c.execute(
             """UPDATE trades SET status='closed', closed_at=?, close_price=?,
-               pnl_pct=?, note=COALESCE(note,'') || ? WHERE id=?""",
-            (time.time(), close_price, pnl, " | " + note, trade_id),
+               pnl_pct=?, note=? WHERE id=?""",
+            (time.time(), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
         )
         return pnl
 
 
 def mark_tp(trade_id, level):
-    """level = 1, 2, or 3"""
     col = f"tp{level}_hit"
     with db() as c:
         c.execute(f"UPDATE trades SET {col}=1 WHERE id=?", (trade_id,))
@@ -114,8 +189,8 @@ def list_open_text():
     for t in trades:
         lines.append(
             f"#{t['id']} <b>{t['symbol']}</b> @ {t['entry_price']:.6g}\n"
-            f"   حجم: {t['size_usd']}$ | SL: {t['stop_loss']:.6g}\n"
-            f"   TP: {t['tp1']:.6g} / {t['tp2']:.6g} / {t['tp3']:.6g}"
+            f"   حجم: {t['size_usd']}$ | SL: {t['stop_loss']}\n"
+            f"   TP: {t['tp1']} / {t['tp2']} / {t['tp3']}"
         )
     return "\n\n".join(lines)
 
@@ -130,7 +205,6 @@ def get_all_trades(limit=50):
 
 
 def report_text(limit=40):
-    """تقرير مختصر: اسم العملة + ربح/خسارة"""
     trades = get_all_trades(limit)
     if not trades:
         return "لا يوجد سجل صفقات."
@@ -149,7 +223,6 @@ def report_text(limit=40):
 
         if status == "open":
             open_n += 1
-            # حالة مفتوحة
             tp_hits = int(t.get("tp1_hit") or 0) + int(t.get("tp2_hit") or 0) + int(t.get("tp3_hit") or 0)
             extra = f" | أهداف {tp_hits}/3" if tp_hits else ""
             lines.append(f"⏳ <b>{sym}</b> — مفتوحة{extra}")

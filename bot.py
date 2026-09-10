@@ -750,6 +750,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
 
     async def post_init(application: Application):
+        import trades_db
+        trades_db.init()  # تحميل/إنشاء جداول الصفقات والإعدادات
+        log.info("DB ready | open trades: %s", trades_db.count_open())
         from position_manager import position_loop
         application.create_task(continuous_monitor(application))
         application.create_task(position_loop(application))
