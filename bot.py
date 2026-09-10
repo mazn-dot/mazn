@@ -92,18 +92,11 @@ def main_keyboard():
                 InlineKeyboardButton("⚙️ إعدادات التداول", callback_data="trade_settings"),
             ],
             [
-                InlineKeyboardButton("📋 صفقاتي", callback_data="my_trades"),
+                InlineKeyboardButton("📋 صفقاتي / تحديد للبيع", callback_data="my_trades"),
                 InlineKeyboardButton("📊 تقرير", callback_data="pnl_report"),
             ],
             [
                 InlineKeyboardButton("💰 رصيدي", callback_data="show_balance"),
-            ],
-            [
-                InlineKeyboardButton("✅ اقفل الربحان", callback_data="close_winners"),
-                InlineKeyboardButton("❌ اقفل الخسران", callback_data="close_losers"),
-            ],
-            [
-                InlineKeyboardButton("🛑 بيع كل الصفقات", callback_data="sell_all"),
             ],
         ]
     )
@@ -212,6 +205,61 @@ async def fetch(prefix, minutes):
         return text, result_keyboard(url)
     data = await loop.run_in_executor(None, get_top_counterparties, minutes, wallets)
     return format_discovery(data, minutes), result_keyboard()
+
+
+async def trade_selection_data(trades):
+    """Fetch current prices without blocking Telegram and return display data."""
+    import mexc_trade
+    prices = {}
+    for trade in trades:
+        pair = mexc_trade.resolve_symbol(trade["symbol"])
+        try:
+            prices[trade["id"]] = await asyncio.to_thread(mexc_trade.get_price, pair)
+        except Exception:
+            prices[trade["id"]] = 0.0
+    return prices
+
+
+def trade_selection_markup(trades, prices, selected):
+    rows = []
+    for trade in trades[:20]:
+        trade_id = trade["id"]
+        entry = float(trade.get("entry_price") or 0)
+        price = float(prices.get(trade_id) or 0)
+        if entry > 0 and price > 0:
+            pnl = ((price - entry) / entry) * 100
+            report = f"ربح {pnl:+.1f}%" if pnl >= 0 else f"خسارة {pnl:.1f}%"
+        else:
+            report = "السعر غير متاح"
+        mark = "☑️" if trade_id in selected else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {trade['symbol']} | {report}",
+            callback_data=f"trade_toggle_{trade_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton("☑️ تحديد الكل", callback_data="trade_select_all"),
+        InlineKeyboardButton("⬜ إلغاء الكل", callback_data="trade_clear_all"),
+    ])
+    rows.append([InlineKeyboardButton("🛑 بيع المحدد", callback_data="trade_sell_selected")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def trade_selection_text(trades, prices, selected):
+    lines = ["📋 <b>صفقاتي — حدد للبيع</b>", "", "اضغط على الصفقة لتحديدها أو إلغاء تحديدها:"]
+    for trade in trades[:20]:
+        trade_id = trade["id"]
+        entry = float(trade.get("entry_price") or 0)
+        price = float(prices.get(trade_id) or 0)
+        if entry > 0 and price > 0:
+            pnl = ((price - entry) / entry) * 100
+            tag = f"ربح {pnl:+.1f}%" if pnl >= 0 else f"خسارة {pnl:.1f}%"
+        else:
+            tag = "السعر غير متاح"
+        mark = "☑️" if trade_id in selected else "⬜"
+        lines.append(f"{mark} <b>#{trade_id} {trade['symbol']}</b> — {tag}")
+    lines += ["", f"المحدد للبيع: <b>{len(selected)}</b>"]
+    return "\n".join(lines)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,64 +371,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
 
-    if data in ("close_winners", "close_losers"):
-        import mexc_trade
-        mode = "winners" if data == "close_winners" else "losers"
-        trades = trades_db.get_open_trades()
-        if not trades:
-            await query.edit_message_text("لا توجد صفقات مفتوحة.", reply_markup=main_keyboard(), **KW)
-            return
-
-        winners, losers = [], []
-        for t in trades:
-            pair = mexc_trade.resolve_symbol(t["symbol"])
-            price = await asyncio.to_thread(mexc_trade.get_price, pair)
-            entry = float(t["entry_price"] or 0)
-            if price <= 0 or entry <= 0:
-                continue
-            pnl = ((price - entry) / entry) * 100
-            item = (t, price, pnl)
-            if pnl >= 0:
-                winners.append(item)
-            else:
-                losers.append(item)
-
-        targets = winners if mode == "winners" else losers
-        label = "الربحان" if mode == "winners" else "الخسران"
-
-        if not targets:
-            await query.edit_message_text(
-                f"مفيش صفقات {label} حالياً.\n\n"
-                f"✅ رابحة: {len(winners)}\n❌ خاسرة: {len(losers)}",
-                reply_markup=main_keyboard(),
-                **KW,
-            )
-            return
-
-        results = []
-        closed = 0
-        for t, price, pnl in targets:
-            pair = mexc_trade.resolve_symbol(t["symbol"])
-            real_bal = await asyncio.to_thread(mexc_trade.get_base_balance, pair)
-            qty = real_bal if real_bal > 0 else float(t["quantity"] or 0)
-            order = await asyncio.to_thread(mexc_trade.market_sell, pair, qty)
-            if order_failed(order):
-                results.append(f"⚠️ <b>{t['symbol']}</b> فشل البيع ولم تُغلق في السجل")
-                continue
-            trades_db.close_trade(t["id"], price, note=f"Close{label}")
-            closed += 1
-            sign = "+" if pnl >= 0 else ""
-            results.append(f"{'✅' if pnl>=0 else '❌'} <b>{t['symbol']}</b> {sign}{pnl:.1f}%")
-
-        msg = (
-            f"تم إغلاق <b>{closed}</b> صفقة من {label}\n\n"
-            + "\n".join(results) +
-            f"\n\nالمتبقي — ✅ رابحة: {len(winners) if mode=='losers' else 0} | "
-            f"❌ خاسرة: {len(losers) if mode=='winners' else 0}"
-        )
-        await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
-        return
-
     if data == "show_balance":
         import mexc_trade
         try:
@@ -395,48 +385,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "sell_all":
-        # تأكيد أولاً
-        await query.edit_message_text(
-            "⚠️ <b>هل أنت متأكد من بيع كل الصفقات المفتوحة؟</b>",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ نعم، بيع الكل", callback_data="sell_all_confirm"),
-                    InlineKeyboardButton("❌ إلغاء", callback_data="back"),
-                ]
-            ]),
-            **KW,
-        )
-        return
-
-    if data == "sell_all_confirm":
-        import mexc_trade
-        trades = trades_db.get_open_trades()
-        if not trades:
-            await query.edit_message_text(
-                "لا توجد صفقات مفتوحة.",
-                reply_markup=main_keyboard(),
-                **KW,
-            )
-            return
-        results = []
-        for t in trades:
-            pair = mexc_trade.resolve_symbol(t["symbol"])
-            price = await asyncio.to_thread(mexc_trade.get_price, pair)
-            qty = t["quantity"]
-            # خصم الكميات اللي اتباعت في أهداف سابقة بشكل تقريبي
-            # نبيع الكمية المتبقية المسجلة
-            order = await asyncio.to_thread(mexc_trade.market_sell, pair, qty)
-            if order_failed(order):
-                results.append(f"⚠️ #{t['id']} {t['symbol']}: فشل البيع وبقيت مفتوحة")
-                continue
-            close_price = price if price > 0 else t["entry_price"]
-            pnl = trades_db.close_trade(t["id"], close_price, note="SellAll")
-            results.append(f"#{t['id']} {t['symbol']}: PnL ≈ {pnl:.1f}%" if pnl is not None else f"#{t['id']} {t['symbol']}: {order}")
-        msg = "🛑 <b>تم إغلاق كل الصفقات</b>\n\n" + "\n".join(results)
-        await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
-        return
-
     if data == "pnl_report":
         await query.edit_message_text(
             trades_db.report_text(40),
@@ -446,11 +394,97 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "my_trades":
+        trades = trades_db.get_open_trades()
+        if not trades:
+            await query.edit_message_text(
+                "لا توجد صفقات مفتوحة.", reply_markup=main_keyboard(), **KW
+            )
+            return
+        prices = await trade_selection_data(trades)
+        context.user_data["trade_prices"] = prices
+        context.user_data["trade_selected"] = set()
         await query.edit_message_text(
-            "📋 <b>الصفقات المفتوحة</b>\n\n" + trades_db.list_open_text(),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]),
+            trade_selection_text(trades, prices, set()),
+            reply_markup=trade_selection_markup(trades, prices, set()),
             **KW,
         )
+        return
+
+    if data.startswith("trade_toggle_"):
+        try:
+            trade_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        selected = set(context.user_data.get("trade_selected", set()))
+        if trade_id in selected:
+            selected.remove(trade_id)
+        else:
+            selected.add(trade_id)
+        trades = trades_db.get_open_trades()
+        prices = context.user_data.get("trade_prices", {})
+        context.user_data["trade_selected"] = selected
+        await query.edit_message_text(
+            trade_selection_text(trades, prices, selected),
+            reply_markup=trade_selection_markup(trades, prices, selected),
+            **KW,
+        )
+        return
+
+    if data in ("trade_select_all", "trade_clear_all"):
+        trades = trades_db.get_open_trades()
+        selected = {t["id"] for t in trades} if data == "trade_select_all" else set()
+        prices = context.user_data.get("trade_prices", {})
+        context.user_data["trade_selected"] = selected
+        await query.edit_message_text(
+            trade_selection_text(trades, prices, selected),
+            reply_markup=trade_selection_markup(trades, prices, selected),
+            **KW,
+        )
+        return
+
+    if data == "trade_sell_selected":
+        selected = set(context.user_data.get("trade_selected", set()))
+        if not selected:
+            trades = trades_db.get_open_trades()
+            prices = context.user_data.get("trade_prices", {})
+            await query.edit_message_text(
+                "⚠️ حدد صفقة واحدة على الأقل أولاً.",
+                reply_markup=trade_selection_markup(trades, prices, selected),
+                **KW,
+            )
+            return
+        await query.edit_message_text(
+            "⚠️ <b>تأكيد البيع</b>\n\nسيتم بيع الصفقات المحددة فقط. هل تريد المتابعة؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ نعم، بيع المحدد", callback_data="trade_sell_confirm")],
+                [InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="my_trades")],
+            ]),
+            **KW,
+        )
+        return
+
+    if data == "trade_sell_confirm":
+        import mexc_trade
+        selected = set(context.user_data.get("trade_selected", set()))
+        trades = [t for t in trades_db.get_open_trades() if t["id"] in selected]
+        results = []
+        closed = 0
+        for trade in trades:
+            pair = mexc_trade.resolve_symbol(trade["symbol"])
+            price = await asyncio.to_thread(mexc_trade.get_price, pair)
+            qty = await asyncio.to_thread(mexc_trade.get_base_balance, pair)
+            qty = qty if qty > 0 else float(trade["quantity"] or 0)
+            order = await asyncio.to_thread(mexc_trade.market_sell, pair, qty)
+            if order_failed(order):
+                results.append(f"⚠️ {trade['symbol']}: فشل البيع وبقيت مفتوحة")
+                continue
+            close_price = price if price > 0 else float(trade["entry_price"] or 0)
+            pnl = trades_db.close_trade(trade["id"], close_price, note="SelectedSell")
+            closed += 1
+            results.append(f"✅ {trade['symbol']}: PnL {pnl:+.1f}%")
+        context.user_data["trade_selected"] = set()
+        msg = f"🛑 تم بيع <b>{closed}</b> من أصل <b>{len(trades)}</b> صفقة محددة\n\n" + "\n".join(results)
+        await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
         return
 
     # ---- تعديل النسب بالأزرار ----
