@@ -4,7 +4,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TOP_N = 10
 MIN_TRANSFERS = 3
-
 # Continuous monitoring (free-friendly)
 MONITOR_INTERVAL_SEC = 300          # كل 5 دقايق
 ALERT_COOLDOWN_SEC = 1200           # 20 دقيقة cooldown لنفس التوكن
@@ -29,12 +28,13 @@ TIME_PERIODS = [
     ("24 ساعة", 1440),
 ]
 
-# Free-friendly chains only (most reliable public RPCs)
+# Bloxroute accepts wallet/topic-filtered eth_getLogs on the public endpoints.
+# The previous PublicNode/Dataseed endpoints returned provider restriction errors.
 CHAINS = {
     "bsc": {
         "name": "BSC",
-        "rpc": "https://bsc-dataseed.binance.org",
-        "rpc_backup": "https://rpc-bnb.blockmachine.io",
+        "rpc": "https://bsc.rpc.blxrbdn.com",
+        "rpc_backup": "https://bsc-dataseed1.binance.org",
         "dex": "bsc",
         "explorer": "https://bscscan.com",
         "native": "BNB",
@@ -42,13 +42,12 @@ CHAINS = {
     },
     "base": {
         "name": "Base",
-        "rpc": "https://mainnet.base.org",
-        "rpc_backup": "https://base.llamarpc.com",
+        "rpc": "https://base.rpc.blxrbdn.com",
+        "rpc_backup": "https://base-rpc.publicnode.com",
         "dex": "base",
         "explorer": "https://basescan.org",
         "native": "ETH",
         "blocks_per_min": 30,
     },
 }
-
 ACTIVE_CHAINS = list(CHAINS.keys())

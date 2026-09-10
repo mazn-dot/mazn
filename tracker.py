@@ -36,7 +36,10 @@ def rpc(chain_id, method, params):
         times = _rpc_times.setdefault(chain_id, [])
         while times and times[0] < now - 60:
             times.pop(0)
-        if len(times) >= 25:
+        # A 24-hour scan can require several getLogs windows plus token metadata.
+        # Keep enough headroom while still protecting free public RPC endpoints.
+        if len(times) >= 100:
+            log.warning("RPC rate guard reached for %s; returning no result", chain_id)
             return None
         times.append(now)
     urls = [cfg["rpc"]]
@@ -179,21 +182,31 @@ def transfers_on_chain(chain_id, address, direction, minutes, cap=1200):
 
     out = {}
     ranked = sorted(raw.items(), key=lambda p: p[1]["raw_amount"], reverse=True)[: TOP_N * 2]
-    for contract, item in ranked:
-        meta = token_meta(chain_id, contract)
-        decimals = meta["decimals"]
-        amount = item["raw_amount"] / (10 ** decimals if decimals else 1)
-        count = item["count"]
-        score = amount * (1.0 + (count ** 0.6) / 8.0)
-        out[contract] = {
-            "amount": amount,
-            "count": count,
-            "score": score,
-            "symbol": meta["symbol"],
-            "name": meta["name"],
-            "chain": chain_id,
-            "contract": contract,
+    # Metadata lookup is network-bound; doing it serially made a single wallet
+    # report take minutes when several tokens were found.
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(ranked)))) as pool:
+        metadata = {
+            contract: future
+            for contract, future in (
+                (contract, pool.submit(token_meta, chain_id, contract))
+                for contract, _ in ranked
+            )
         }
+        for contract, item in ranked:
+            meta = metadata[contract].result()
+            decimals = meta["decimals"]
+            amount = item["raw_amount"] / (10 ** decimals if decimals else 1)
+            count = item["count"]
+            score = amount * (1.0 + (count ** 0.6) / 8.0)
+            out[contract] = {
+                "amount": amount,
+                "count": count,
+                "score": score,
+                "symbol": meta["symbol"],
+                "name": meta["name"],
+                "chain": chain_id,
+                "contract": contract,
+            }
     return out
 
 
