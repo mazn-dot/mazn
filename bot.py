@@ -81,6 +81,42 @@ def main_keyboard():
     )
 
 
+
+def _settings_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💵 حجم +", callback_data="set_size_up"),
+                InlineKeyboardButton("💵 حجم -", callback_data="set_size_down"),
+            ],
+            [
+                InlineKeyboardButton("🛑 وقف أضيق", callback_data="set_sl_up"),
+                InlineKeyboardButton("🛑 وقف أوسع", callback_data="set_sl_down"),
+            ],
+            [
+                InlineKeyboardButton("🎯1 +", callback_data="set_tp1_up"),
+                InlineKeyboardButton("🎯1 -", callback_data="set_tp1_down"),
+                InlineKeyboardButton("🎯2 +", callback_data="set_tp2_up"),
+                InlineKeyboardButton("🎯2 -", callback_data="set_tp2_down"),
+            ],
+            [
+                InlineKeyboardButton("🎯3 +", callback_data="set_tp3_up"),
+                InlineKeyboardButton("🎯3 -", callback_data="set_tp3_down"),
+            ],
+            [
+                InlineKeyboardButton("📊 حد صفقات +", callback_data="set_max_up"),
+                InlineKeyboardButton("📊 حد صفقات -", callback_data="set_max_down"),
+            ],
+            [
+                InlineKeyboardButton("🤖 تفعيل/إيقاف شراء", callback_data="toggle_autobuy"),
+            ],
+            [
+                InlineKeyboardButton("🔙 رجوع", callback_data="back"),
+            ],
+        ]
+    )
+
+
 def periods(prefix):
     rows, row = [], []
     for label, minutes in TIME_PERIODS:
@@ -244,36 +280,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "trade_settings":
-        await query.edit_message_text(
-            settings.text() + "\n\nعدّل من الأزرار أو ابعت أمر:\n"
-            "<code>حجم 25</code>\n"
-            "<code>وقف -8</code>\n"
-            "<code>هدف1 5</code>\n"
-            "<code>هدف2 10</code>\n"
-            "<code>هدف3 15</code>\n"
-            "<code>حد 3</code>",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("💵 حجم+", callback_data="set_size_up"),
-                    InlineKeyboardButton("💵 حجم-", callback_data="set_size_down"),
-                ],
-                [
-                    InlineKeyboardButton("🛑 وقف أضيق", callback_data="set_sl_up"),
-                    InlineKeyboardButton("🛑 وقف أوسع", callback_data="set_sl_down"),
-                ],
-                [
-                    InlineKeyboardButton("🤖 تفعيل شراء", callback_data="toggle_autobuy"),
-                    InlineKeyboardButton("🔙 رجوع", callback_data="back"),
-                ],
-            ]),
-            **KW,
-        )
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
 
     if data == "toggle_autobuy":
         cur = settings.get("auto_buy_enabled")
         settings.set_value("auto_buy_enabled", not cur)
-        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
 
     if data == "my_trades":
@@ -284,25 +297,54 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ---- تعديل النسب بالأزرار ----
     if data == "set_size_up":
-        v = float(settings.get("trade_size_usd")) + 5
-        settings.set_value("trade_size_usd", v)
-        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        settings.set_value("trade_size_usd", float(settings.get("trade_size_usd")) + 5)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
     if data == "set_size_down":
-        v = max(5, float(settings.get("trade_size_usd")) - 5)
-        settings.set_value("trade_size_usd", v)
-        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        settings.set_value("trade_size_usd", max(5, float(settings.get("trade_size_usd")) - 5))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
     if data == "set_sl_up":
-        v = min(-1, float(settings.get("stop_loss_pct")) + 1)
-        settings.set_value("stop_loss_pct", v)
-        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        settings.set_value("stop_loss_pct", min(-1, float(settings.get("stop_loss_pct")) + 1))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
     if data == "set_sl_down":
-        v = float(settings.get("stop_loss_pct")) - 1
-        settings.set_value("stop_loss_pct", v)
-        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        settings.set_value("stop_loss_pct", float(settings.get("stop_loss_pct")) - 1)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp1_up":
+        settings.set_value("tp1_pct", float(settings.get("tp1_pct")) + 1)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp1_down":
+        settings.set_value("tp1_pct", max(1, float(settings.get("tp1_pct")) - 1))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp2_up":
+        settings.set_value("tp2_pct", float(settings.get("tp2_pct")) + 1)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp2_down":
+        settings.set_value("tp2_pct", max(2, float(settings.get("tp2_pct")) - 1))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp3_up":
+        settings.set_value("tp3_pct", float(settings.get("tp3_pct")) + 1)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_tp3_down":
+        settings.set_value("tp3_pct", max(3, float(settings.get("tp3_pct")) - 1))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_max_up":
+        settings.set_value("max_open_trades", int(settings.get("max_open_trades")) + 1)
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+    if data == "set_max_down":
+        settings.set_value("max_open_trades", max(1, int(settings.get("max_open_trades")) - 1))
+        await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
 
     if data == "run_best":
