@@ -14,6 +14,9 @@ from telegram.ext import (
 )
 
 import wallets as store
+import settings
+import trades_db
+from executor import try_auto_buy
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIME_PERIODS
 from formatter import (
     format_best_opportunities,
@@ -47,6 +50,8 @@ def authorized(update):
 
 
 def main_keyboard():
+    mon = settings.get("monitoring_enabled")
+    mon_btn = "⏹ إيقاف الرصد" if mon else "▶️ تشغيل الرصد"
     return InlineKeyboardMarkup(
         [
             [
@@ -64,6 +69,13 @@ def main_keyboard():
             [
                 InlineKeyboardButton("🐋 حيتان توكن", callback_data="whale_search"),
                 InlineKeyboardButton("⚙️ المحافظ", callback_data="wallets"),
+            ],
+            [
+                InlineKeyboardButton(mon_btn, callback_data="toggle_monitor"),
+                InlineKeyboardButton("⚙️ إعدادات التداول", callback_data="trade_settings"),
+            ],
+            [
+                InlineKeyboardButton("📋 صفقاتي", callback_data="my_trades"),
             ],
         ]
     )
@@ -217,6 +229,82 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg + "\n\n" + store.list_text(), reply_markup=wallets_keyboard(), **KW)
         return
 
+
+    # --- Trading controls ---
+    if data == "toggle_monitor":
+        cur = settings.get("monitoring_enabled")
+        settings.set_value("monitoring_enabled", not cur)
+        # لو شغلنا الرصد نشغل الشراء التلقائي كمان افتراضياً
+        if not cur:
+            settings.set_value("auto_buy_enabled", True)
+        else:
+            settings.set_value("auto_buy_enabled", False)
+        state = "🟢 تم تشغيل الرصد + الشراء التلقائي" if not cur else "🔴 تم إيقاف الرصد"
+        await query.edit_message_text(state + "\n\n" + settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+
+    if data == "trade_settings":
+        await query.edit_message_text(
+            settings.text() + "\n\nعدّل من الأزرار أو ابعت أمر:\n"
+            "<code>حجم 25</code>\n"
+            "<code>وقف -8</code>\n"
+            "<code>هدف1 5</code>\n"
+            "<code>هدف2 10</code>\n"
+            "<code>هدف3 15</code>\n"
+            "<code>حد 3</code>",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("💵 حجم+", callback_data="set_size_up"),
+                    InlineKeyboardButton("💵 حجم-", callback_data="set_size_down"),
+                ],
+                [
+                    InlineKeyboardButton("🛑 وقف أضيق", callback_data="set_sl_up"),
+                    InlineKeyboardButton("🛑 وقف أوسع", callback_data="set_sl_down"),
+                ],
+                [
+                    InlineKeyboardButton("🤖 تفعيل شراء", callback_data="toggle_autobuy"),
+                    InlineKeyboardButton("🔙 رجوع", callback_data="back"),
+                ],
+            ]),
+            **KW,
+        )
+        return
+
+    if data == "toggle_autobuy":
+        cur = settings.get("auto_buy_enabled")
+        settings.set_value("auto_buy_enabled", not cur)
+        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+
+    if data == "my_trades":
+        await query.edit_message_text(
+            "📋 <b>الصفقات المفتوحة</b>\n\n" + trades_db.list_open_text(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]),
+            **KW,
+        )
+        return
+
+    if data == "set_size_up":
+        v = float(settings.get("trade_size_usd")) + 5
+        settings.set_value("trade_size_usd", v)
+        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+    if data == "set_size_down":
+        v = max(5, float(settings.get("trade_size_usd")) - 5)
+        settings.set_value("trade_size_usd", v)
+        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+    if data == "set_sl_up":
+        v = min(-1, float(settings.get("stop_loss_pct")) + 1)
+        settings.set_value("stop_loss_pct", v)
+        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+    if data == "set_sl_down":
+        v = float(settings.get("stop_loss_pct")) - 1
+        settings.set_value("stop_loss_pct", v)
+        await query.edit_message_text(settings.text(), reply_markup=main_keyboard(), **KW)
+        return
+
     if data == "run_best":
         prefix, minutes = "best", 0
     elif data.startswith("report_"):
@@ -321,6 +409,59 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg + "\n\n" + store.list_text(), reply_markup=main_keyboard(), **KW)
         return
 
+    # --- إعدادات نصية ---
+    low = text.strip().lower()
+    if low.startswith("حجم "):
+        try:
+            v = float(text.split()[1])
+            settings.set_value("trade_size_usd", v)
+            await update.message.reply_text(f"✅ حجم الصفقة = {v}$\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: حجم 20")
+        return
+    if low.startswith("وقف "):
+        try:
+            v = float(text.split()[1])
+            if v > 0:
+                v = -v
+            settings.set_value("stop_loss_pct", v)
+            await update.message.reply_text(f"✅ وقف الخسارة = {v}%\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: وقف -8")
+        return
+    if low.startswith("هدف1 "):
+        try:
+            v = float(text.split()[1])
+            settings.set_value("tp1_pct", abs(v))
+            await update.message.reply_text(f"✅ الهدف 1 = +{abs(v)}%\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: هدف1 5")
+        return
+    if low.startswith("هدف2 "):
+        try:
+            v = float(text.split()[1])
+            settings.set_value("tp2_pct", abs(v))
+            await update.message.reply_text(f"✅ الهدف 2 = +{abs(v)}%\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: هدف2 10")
+        return
+    if low.startswith("هدف3 "):
+        try:
+            v = float(text.split()[1])
+            settings.set_value("tp3_pct", abs(v))
+            await update.message.reply_text(f"✅ الهدف 3 = +{abs(v)}%\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: هدف3 15")
+        return
+    if low.startswith("حد "):
+        try:
+            v = int(text.split()[1])
+            settings.set_value("max_open_trades", max(1, v))
+            await update.message.reply_text(f"✅ أقصى صفقات = {v}\n\n" + settings.text(), parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("مثال: حد 3")
+        return
+
     # Default help
     if text in ("/help", "مساعدة", "?"):
         await update.message.reply_text(
@@ -406,6 +547,20 @@ async def continuous_monitor(app):
                     )
                     _alerted_tokens[ckey] = now
                     log.info("ALERT sent for %s (%s)", symbol, ckey)
+
+                    # شراء تلقائي عند الفرصة
+                    ok, buy_msg = try_auto_buy(
+                        symbol=symbol,
+                        contract=contract,
+                        chain=chain,
+                        note="سحب جماعي",
+                    )
+                    if ok or ("معطّل" not in buy_msg and "متوقف" not in buy_msg):
+                        await app.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=buy_msg,
+                            parse_mode="HTML",
+                        )
                 except Exception as e:
                     log.warning("Failed to send alert: %s", e)
 
@@ -426,8 +581,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
 
     async def post_init(application: Application):
+        from position_manager import position_loop
         application.create_task(continuous_monitor(application))
-        log.info("Continuous monitor task started")
+        application.create_task(position_loop(application))
+        log.info("Continuous monitor + position manager started")
 
     app.post_init = post_init
     log.info("Wallet tracker FREE mode (BSC+Base only)")
