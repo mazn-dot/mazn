@@ -49,18 +49,40 @@ def try_auto_buy(symbol, contract="", chain="", note="سحب جماعي"):
 
     # تنفيذ الشراء
     order = mexc_trade.market_buy(pair, size)
-    if order.get("error") or (order.get("code") and order.get("code") != 200):
+    if not isinstance(order, dict):
+        return False, f"فشل أمر الشراء: {order}"
+    if order.get("error"):
+        return False, f"فشل أمر الشراء: {order}"
+    if order.get("code") and int(order.get("code", 0)) not in (0, 200):
         return False, f"فشل أمر الشراء: {order}"
 
-    # تقدير الكمية
-    qty = size / price
-    # لو الـ API رجّع executedQty نستخدمه
+    # لازم يكون فيه تنفيذ فعلي
+    executed = 0.0
+    quote_filled = 0.0
     try:
-        if order.get("executedQty"):
-            qty = float(order["executedQty"])
-        elif order.get("cummulativeQuoteQty"):
-            qty = float(order["cummulativeQuoteQty"]) / price
+        executed = float(order.get("executedQty") or 0)
+        quote_filled = float(order.get("cummulativeQuoteQty") or 0)
     except (TypeError, ValueError):
+        pass
+
+    if executed <= 0 and quote_filled <= 0:
+        # بعض الردود الناجحة بتكون status NEW ثم تتنفذ — لو status ملغي نرفض
+        status = str(order.get("status", "")).upper()
+        if status in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+            return False, f"الأمر اتلغى بدون تنفيذ: {order}"
+        # لو مفيش executedQty خالص اعتبره فشل
+        if not order.get("orderId"):
+            return False, f"فشل أمر الشراء (لا يوجد orderId): {order}"
+
+    qty = executed if executed > 0 else (quote_filled / price if quote_filled > 0 else size / price)
+    if qty <= 0:
+        return False, f"كمية منفذة صفر: {order}"
+
+    # استخدم متوسط السعر الفعلي لو موجود
+    try:
+        if quote_filled > 0 and executed > 0:
+            price = quote_filled / executed
+    except Exception:
         pass
 
     trade_id = trades_db.open_trade(

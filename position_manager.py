@@ -42,7 +42,10 @@ async def check_positions(app):
         # ---------- Stop Loss ----------
         if sl and price <= sl:
             log.info("SL hit for #%s %s @ %s (SL=%s)", trade_id, symbol, price, sl)
-            result = mexc_trade.market_sell(pair, qty)
+            # استخدم الرصيد الفعلي لو متاح عشان نتجنب quantity scale errors
+            real_bal = mexc_trade.get_base_balance(pair)
+            sell_qty = real_bal if real_bal > 0 else qty
+            result = mexc_trade.market_sell(pair, sell_qty)
             trades_db.close_trade(trade_id, price, note="StopLoss")
             await _notify(
                 app,
