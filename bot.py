@@ -200,13 +200,19 @@ async def fetch(prefix, minutes):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
+    import trades_db
+    trades_db.init()
+    trades_db.refresh_use_pg()
+    open_n = trades_db.count_open()
+    s = settings.load()
+    mon = "شغال" if s.get("monitoring_enabled") else "متوقف"
     message = (
-        "👋 <b>بوت مراقبة المحافظ — 5 شبكات</b>\n\n"
-        "BSC · ETH · Base · Arbitrum · Polygon\n\n"
-        "• عرض نظيف: التوكن + سبب جلبه فقط\n"
-        "• Score = كمية + عدد التحويلات\n"
-        "• حيتان + إضافة محافظ\n\n"
-        "اختر التقرير:"
+        f"👋 <b>بوت التداول</b>\n\n"
+        f"{trades_db.storage_status_text()}\n\n"
+        f"صفقات مفتوحة: <b>{open_n}</b>\n"
+        f"الرصد: <b>{mon}</b>\n"
+        f"حجم الصفقة: <b>{s.get('trade_size_usd')}$</b>\n\n"
+        f"اختر من القائمة:"
     )
     await update.message.reply_text(message, reply_markup=main_keyboard(), **KW)
 
@@ -759,9 +765,8 @@ def main():
                 log.info("Imported %s old trades", n)
         except Exception as e:
             log.warning("migrate_old skip: %s", e)
-        log.info("DB ready | mode=%s | open trades: %s",
-                 "postgres" if trades_db.USE_PG else "sqlite",
-                 trades_db.count_open())
+        trades_db.refresh_use_pg()
+        log.info("DB ready | %s | open=%s", trades_db.storage_status_text().replace("\n"," | "), trades_db.count_open())
         from position_manager import position_loop
         application.create_task(continuous_monitor(application))
         application.create_task(position_loop(application))

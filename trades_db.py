@@ -1,7 +1,6 @@
 """
-حفظ مزدوج:
-- لو موجود DATABASE_URL → PostgreSQL (ثابت على Railway)
-- غير كده → SQLite ملف محلي
+حفظ على PostgreSQL إن وُجد اتصال حقيقي، وإلا SQLite.
+يعرض سبب الفشل بوضوح.
 """
 import os
 import time
@@ -11,10 +10,8 @@ from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-USE_PG = DATABASE_URL.startswith("postgres")
-
-DB_SQLITE = os.path.join(os.path.dirname(__file__), "trades.db")
+DB_SQLITE = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+os.makedirs(os.path.dirname(DB_SQLITE), exist_ok=True)
 
 DEFAULT_SETTINGS = {
     "trade_size_usd": 20.0,
@@ -27,25 +24,98 @@ DEFAULT_SETTINGS = {
     "auto_buy_enabled": False,
 }
 
-_pg = None
+# حالة الاتصال الفعلية
+_STATUS = {
+    "mode": "sqlite",
+    "reason": "لم يتم الفحص بعد",
+    "url_found": False,
+}
+
+_pg_conn = None
+
+
+def _find_database_url():
+    """كل الأسماء الشائعة على Railway"""
+    keys = [
+        "DATABASE_URL",
+        "DATABASE_PRIVATE_URL",
+        "POSTGRES_URL",
+        "POSTGRESQL_URL",
+        "PGURL",
+        "DB_URL",
+    ]
+    for k in keys:
+        v = (os.getenv(k) or "").strip()
+        if v and ("postgres" in v.lower() or v.startswith("postgresql")):
+            return k, v
+    # أي env فيه postgres
+    for k, v in os.environ.items():
+        if v and "postgres" in v.lower() and "://" in v and "url" in k.lower():
+            return k, v.strip()
+    return None, ""
 
 
 def _get_pg():
-    global _pg
-    if _pg is not None:
-        return _pg
+    global _pg_conn
+    if _pg_conn is not None:
+        try:
+            _pg_conn.cursor().execute("SELECT 1")
+            return _pg_conn
+        except Exception:
+            _pg_conn = None
+
+    key, url = _find_database_url()
+    if not url:
+        _STATUS.update(mode="sqlite", reason="مفيش DATABASE_URL في متغيرات البوت", url_found=False)
+        return None
+
+    _STATUS["url_found"] = True
     try:
         import psycopg2
         from psycopg2.extras import RealDictCursor
-        # Railway sometimes gives postgres:// which psycopg2 needs as postgresql://
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        _pg = psycopg2.connect(url, cursor_factory=RealDictCursor)
-        _pg.autocommit = True
-        log.info("Connected to PostgreSQL")
-        return _pg
+        url = url.replace("postgres://", "postgresql://", 1)
+        # Railway عادة يحتاج SSL
+        if "sslmode" not in url:
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        conn = psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=15)
+        conn.autocommit = True
+        _pg_conn = conn
+        _STATUS.update(mode="postgres", reason=f"متصل عبر {key}", url_found=True)
+        log.info("Postgres OK via %s", key)
+        return conn
     except Exception as e:
-        log.error("Postgres connect failed: %s — fallback SQLite", e)
-        return None
+        # محاولة ثانية بدون SSL صارم
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            url2 = url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" in url2:
+                # جرب prefer
+                import re
+                url2 = re.sub(r"sslmode=[^&]*", "sslmode=prefer", url2)
+            else:
+                url2 += ("&" if "?" in url2 else "?") + "sslmode=prefer"
+            conn = psycopg2.connect(url2, cursor_factory=RealDictCursor, connect_timeout=15)
+            conn.autocommit = True
+            _pg_conn = conn
+            _STATUS.update(mode="postgres", reason=f"متصل عبر {key} (ssl prefer)", url_found=True)
+            log.info("Postgres OK via %s (prefer)", key)
+            return conn
+        except Exception as e2:
+            _STATUS.update(mode="sqlite", reason=f"فشل الاتصال: {e2}", url_found=True)
+            log.error("Postgres failed: %s | retry: %s", e, e2)
+            return None
+
+
+def storage_status_text():
+    _get_pg()  # refresh
+    if _STATUS["mode"] == "postgres":
+        return f"PostgreSQL 🗄️ ثابت\n{_STATUS['reason']}"
+    return f"SQLite ⚠️ مؤقت (يضيع)\nالسبب: {_STATUS['reason']}"
+
+
+def use_postgres():
+    return _get_pg() is not None
 
 
 def _sqlite():
@@ -57,16 +127,14 @@ def _sqlite():
 
 @contextmanager
 def db():
-    if USE_PG:
-        conn = _get_pg()
-        if conn:
-            cur = conn.cursor()
-            try:
-                yield ("pg", cur)
-            finally:
-                cur.close()
-            return
-    # sqlite
+    conn = _get_pg()
+    if conn is not None:
+        cur = conn.cursor()
+        try:
+            yield ("pg", cur)
+        finally:
+            cur.close()
+        return
     conn = _sqlite()
     cur = conn.cursor()
     try:
@@ -91,18 +159,11 @@ def init():
                 quantity DOUBLE PRECISION NOT NULL,
                 size_usd DOUBLE PRECISION NOT NULL,
                 stop_loss DOUBLE PRECISION,
-                tp1 DOUBLE PRECISION,
-                tp2 DOUBLE PRECISION,
-                tp3 DOUBLE PRECISION,
-                tp1_hit INTEGER DEFAULT 0,
-                tp2_hit INTEGER DEFAULT 0,
-                tp3_hit INTEGER DEFAULT 0,
+                tp1 DOUBLE PRECISION, tp2 DOUBLE PRECISION, tp3 DOUBLE PRECISION,
+                tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, tp3_hit INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'open',
-                opened_at DOUBLE PRECISION,
-                closed_at DOUBLE PRECISION,
-                close_price DOUBLE PRECISION,
-                pnl_pct DOUBLE PRECISION,
-                note TEXT
+                opened_at DOUBLE PRECISION, closed_at DOUBLE PRECISION,
+                close_price DOUBLE PRECISION, pnl_pct DOUBLE PRECISION, note TEXT
             )
             """)
             c.execute("""
@@ -121,26 +182,17 @@ def init():
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
-                contract TEXT,
-                chain TEXT,
-                side TEXT DEFAULT 'buy',
-                entry_price REAL NOT NULL,
-                quantity REAL NOT NULL,
-                size_usd REAL NOT NULL,
-                stop_loss REAL,
-                tp1 REAL, tp2 REAL, tp3 REAL,
-                tp1_hit INTEGER DEFAULT 0,
-                tp2_hit INTEGER DEFAULT 0,
-                tp3_hit INTEGER DEFAULT 0,
+                contract TEXT, chain TEXT, side TEXT DEFAULT 'buy',
+                entry_price REAL NOT NULL, quantity REAL NOT NULL, size_usd REAL NOT NULL,
+                stop_loss REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+                tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, tp3_hit INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'open',
-                opened_at REAL, closed_at REAL,
-                close_price REAL, pnl_pct REAL, note TEXT
+                opened_at REAL, closed_at REAL, close_price REAL, pnl_pct REAL, note TEXT
             )
             """)
             c.execute("""
             CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
             )
             """)
             for k, v in DEFAULT_SETTINGS.items():
@@ -148,25 +200,32 @@ def init():
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (k, json.dumps(v)),
                 )
-    log.info("DB init done mode=%s", "postgres" if USE_PG else "sqlite")
+    # تشخيص: أسماء متغيرات DB الموجودة
+    db_keys = [k for k in os.environ if "DATABASE" in k.upper() or "POSTGRES" in k.upper() or "PG" == k[:2].upper()]
+    log.info("DB env keys present: %s", db_keys)
+    log.info("DB init mode=%s reason=%s", _STATUS["mode"], _STATUS["reason"])
 
 
-def _ph(kind):
-    """placeholder style"""
-    return "%s" if kind == "pg" else "?"
+# For backward compat
+@property
+def USE_PG():
+    return use_postgres()
 
 
-# ---------- Settings ----------
+# monkey for modules that check trades_db.USE_PG as attribute
+class _Mod:
+    pass
+
 
 def get_setting(key, default=None):
     init()
     with db() as (kind, c):
-        ph = _ph(kind)
+        ph = "%s" if kind == "pg" else "?"
         c.execute(f"SELECT value FROM settings WHERE key={ph}", (key,))
         row = c.fetchone()
         if not row:
             return DEFAULT_SETTINGS.get(key) if default is None else default
-        val = row["value"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+        val = row["value"] if hasattr(row, "keys") else row[0]
         try:
             return json.loads(val)
         except Exception:
@@ -176,17 +235,13 @@ def get_setting(key, default=None):
 def set_setting(key, value):
     init()
     with db() as (kind, c):
-        ph = _ph(kind)
         if kind == "pg":
             c.execute(
-                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                "INSERT INTO settings (key, value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                 (key, json.dumps(value)),
             )
         else:
-            c.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                (key, json.dumps(value)),
-            )
+            c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, json.dumps(value)))
     return value
 
 
@@ -195,10 +250,9 @@ def load_settings():
     out = dict(DEFAULT_SETTINGS)
     with db() as (kind, c):
         c.execute("SELECT key, value FROM settings")
-        rows = c.fetchall()
-        for r in rows:
-            k = r["key"] if isinstance(r, dict) or hasattr(r, "keys") else r[0]
-            v = r["value"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+        for r in c.fetchall():
+            k = r["key"] if hasattr(r, "keys") else r[0]
+            v = r["value"] if hasattr(r, "keys") else r[1]
             try:
                 out[k] = json.loads(v)
             except Exception:
@@ -212,8 +266,6 @@ def save_settings(data: dict):
     return load_settings()
 
 
-# ---------- Trades ----------
-
 def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
                stop_loss, tp1, tp2, tp3, note=""):
     init()
@@ -223,31 +275,28 @@ def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
                 """INSERT INTO trades
                 (symbol, contract, chain, entry_price, quantity, size_usd,
                  stop_loss, tp1, tp2, tp3, opened_at, note, status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
-                RETURNING id""",
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') RETURNING id""",
                 (symbol, contract, chain, entry_price, quantity, size_usd,
                  stop_loss, tp1, tp2, tp3, time.time(), note),
             )
             row = c.fetchone()
-            return row["id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-        else:
-            cur = c.execute(
-                """INSERT INTO trades
-                (symbol, contract, chain, entry_price, quantity, size_usd,
-                 stop_loss, tp1, tp2, tp3, opened_at, note, status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
-                (symbol, contract, chain, entry_price, quantity, size_usd,
-                 stop_loss, tp1, tp2, tp3, time.time(), note),
-            )
-            return cur.lastrowid
+            return row["id"] if hasattr(row, "keys") else row[0]
+        cur = c.execute(
+            """INSERT INTO trades
+            (symbol, contract, chain, entry_price, quantity, size_usd,
+             stop_loss, tp1, tp2, tp3, opened_at, note, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
+            (symbol, contract, chain, entry_price, quantity, size_usd,
+             stop_loss, tp1, tp2, tp3, time.time(), note),
+        )
+        return cur.lastrowid
 
 
 def get_open_trades():
     init()
     with db() as (kind, c):
         c.execute("SELECT * FROM trades WHERE status='open' ORDER BY id")
-        rows = c.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in c.fetchall()]
 
 
 def count_open():
@@ -257,7 +306,7 @@ def count_open():
 def close_trade(trade_id, close_price, note=""):
     init()
     with db() as (kind, c):
-        ph = _ph(kind)
+        ph = "%s" if kind == "pg" else "?"
         c.execute(f"SELECT * FROM trades WHERE id={ph}", (trade_id,))
         row = c.fetchone()
         if not row:
@@ -284,7 +333,7 @@ def close_trade(trade_id, close_price, note=""):
 def mark_tp(trade_id, level):
     col = f"tp{level}_hit"
     with db() as (kind, c):
-        ph = _ph(kind)
+        ph = "%s" if kind == "pg" else "?"
         c.execute(f"UPDATE trades SET {col}=1 WHERE id={ph}", (trade_id,))
 
 
@@ -294,17 +343,14 @@ def has_open_symbol(symbol):
 
 
 def list_open_text():
-    """عرض مبسط: اسم | نسبة ربح/خسارة | حجم بالدولار"""
     trades = get_open_trades()
     if not trades:
-        return "لا توجد صفقات مفتوحة."
-
+        return "لا توجد صفقات مفتوحة.\n\n" + storage_status_text()
     lines = ["📋 <b>الصفقات المفتوحة</b>", ""]
     try:
         import mexc_trade
     except Exception:
         mexc_trade = None
-
     for t in trades:
         sym = t.get("symbol") or "?"
         entry = float(t.get("entry_price") or 0)
@@ -312,22 +358,19 @@ def list_open_text():
         pnl = 0.0
         if mexc_trade and entry > 0:
             try:
-                pair = mexc_trade.resolve_symbol(sym)
-                price = mexc_trade.get_price(pair)
+                price = mexc_trade.get_price(mexc_trade.resolve_symbol(sym))
                 if price > 0:
                     pnl = ((price - entry) / entry) * 100
             except Exception:
                 pass
         if pnl > 0.05:
-            tag = f"ربح {pnl:.1f}%"
-            icon = "✅"
+            icon, tag = "✅", f"ربح {pnl:.1f}%"
         elif pnl < -0.05:
-            tag = f"خسارة {pnl:.1f}%"
-            icon = "❌"
+            icon, tag = "❌", f"خسارة {pnl:.1f}%"
         else:
-            tag = f"{pnl:.1f}%"
-            icon = "⏳"
+            icon, tag = "⏳", f"{pnl:.1f}%"
         lines.append(f"{icon} <b>{sym}</b> | {tag} | {size:.0f}$")
+    lines += ["", storage_status_text()]
     return "\n".join(lines)
 
 
@@ -343,9 +386,9 @@ def get_all_trades(limit=50):
 
 def report_text(limit=40):
     trades = get_all_trades(limit)
-    if not trades:
-        return "لا يوجد سجل صفقات."
     lines = ["📊 <b>تقرير الصفقات</b>", ""]
+    if not trades:
+        lines.append("لا يوجد سجل.")
     wins = losses = open_n = 0
     total_pnl = 0.0
     for t in trades:
@@ -357,9 +400,7 @@ def report_text(limit=40):
         size = float(t.get("size_usd") or 0)
         if status == "open":
             open_n += 1
-            tp_hits = int(t.get("tp1_hit") or 0) + int(t.get("tp2_hit") or 0) + int(t.get("tp3_hit") or 0)
-            extra = f" | أهداف {tp_hits}/3" if tp_hits else ""
-            lines.append(f"⏳ <b>{sym}</b> — مفتوحة{extra}")
+            lines.append(f"⏳ <b>{sym}</b> — مفتوحة | {size:.0f}$")
             continue
         if pnl is None and close_p and entry:
             pnl = ((float(close_p) - entry) / entry) * 100
@@ -368,13 +409,21 @@ def report_text(limit=40):
         total_pnl += usd
         if pnl >= 0:
             wins += 1
-            lines.append(f"✅ <b>{sym}</b> — ربح {pnl:.1f}% (~{usd:+.2f}$)")
+            lines.append(f"✅ <b>{sym}</b> | ربح {pnl:.1f}% | {size:.0f}$")
         else:
             losses += 1
-            lines.append(f"❌ <b>{sym}</b> — خسارة {pnl:.1f}% (~{usd:.2f}$)")
+            lines.append(f"❌ <b>{sym}</b> | خسارة {pnl:.1f}% | {size:.0f}$")
     lines += ["", "────────────",
               f"مفتوحة: {open_n} | رابحة: {wins} | خاسرة: {losses}",
-              f"صافي تقديري (المقفلة): <b>{total_pnl:+.2f}$</b>"]
-    mode = "PostgreSQL 🗄️" if USE_PG else "SQLite 📁"
-    lines.append(f"التخزين: {mode}")
+              f"صافي: <b>{total_pnl:+.2f}$</b>",
+              "", storage_status_text()]
     return "\n".join(lines)
+
+
+
+def refresh_use_pg():
+    global USE_PG
+    USE_PG = use_postgres()
+    return USE_PG
+
+USE_PG = False

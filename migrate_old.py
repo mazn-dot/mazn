@@ -15,7 +15,7 @@ def _rows(cur, sql, params=None):
 
 def import_old_trades():
     """يحاول يقرأ من جدول الصفقات القديم وينقل المفتوحة لجدول trades"""
-    if not trades_db.USE_PG:
+    if not trades_db.use_postgres():
         log.info("migrate: no Postgres, skip")
         return 0
 
