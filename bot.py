@@ -76,7 +76,14 @@ def main_keyboard():
             ],
             [
                 InlineKeyboardButton("📋 صفقاتي", callback_data="my_trades"),
+                InlineKeyboardButton("📊 تقرير", callback_data="pnl_report"),
+            ],
+            [
                 InlineKeyboardButton("💰 رصيدي", callback_data="show_balance"),
+            ],
+            [
+                InlineKeyboardButton("✅ اقفل الربحان", callback_data="close_winners"),
+                InlineKeyboardButton("❌ اقفل الخسران", callback_data="close_losers"),
             ],
             [
                 InlineKeyboardButton("🛑 بيع كل الصفقات", callback_data="sell_all"),
@@ -293,6 +300,61 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
         return
 
+    if data in ("close_winners", "close_losers"):
+        import mexc_trade
+        mode = "winners" if data == "close_winners" else "losers"
+        trades = trades_db.get_open_trades()
+        if not trades:
+            await query.edit_message_text("لا توجد صفقات مفتوحة.", reply_markup=main_keyboard(), **KW)
+            return
+
+        winners, losers = [], []
+        for t in trades:
+            pair = mexc_trade.resolve_symbol(t["symbol"])
+            price = mexc_trade.get_price(pair)
+            entry = float(t["entry_price"] or 0)
+            if price <= 0 or entry <= 0:
+                continue
+            pnl = ((price - entry) / entry) * 100
+            item = (t, price, pnl)
+            if pnl >= 0:
+                winners.append(item)
+            else:
+                losers.append(item)
+
+        targets = winners if mode == "winners" else losers
+        label = "الربحان" if mode == "winners" else "الخسران"
+
+        if not targets:
+            await query.edit_message_text(
+                f"مفيش صفقات {label} حالياً.\n\n"
+                f"✅ رابحة: {len(winners)}\n❌ خاسرة: {len(losers)}",
+                reply_markup=main_keyboard(),
+                **KW,
+            )
+            return
+
+        results = []
+        closed = 0
+        for t, price, pnl in targets:
+            pair = mexc_trade.resolve_symbol(t["symbol"])
+            real_bal = mexc_trade.get_base_balance(pair)
+            qty = real_bal if real_bal > 0 else float(t["quantity"] or 0)
+            order = mexc_trade.market_sell(pair, qty)
+            trades_db.close_trade(t["id"], price, note=f"Close{label}")
+            closed += 1
+            sign = "+" if pnl >= 0 else ""
+            results.append(f"{'✅' if pnl>=0 else '❌'} <b>{t['symbol']}</b> {sign}{pnl:.1f}%")
+
+        msg = (
+            f"تم إغلاق <b>{closed}</b> صفقة من {label}\n\n"
+            + "\n".join(results) +
+            f"\n\nالمتبقي — ✅ رابحة: {len(winners) if mode=='losers' else 0} | "
+            f"❌ خاسرة: {len(losers) if mode=='winners' else 0}"
+        )
+        await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
+        return
+
     if data == "show_balance":
         import mexc_trade
         try:
@@ -344,6 +406,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f"#{t['id']} {t['symbol']}: PnL ≈ {pnl:.1f}%" if pnl is not None else f"#{t['id']} {t['symbol']}: {order}")
         msg = "🛑 <b>تم إغلاق كل الصفقات</b>\n\n" + "\n".join(results)
         await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
+        return
+
+    if data == "pnl_report":
+        await query.edit_message_text(
+            trades_db.report_text(40),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]),
+            **KW,
+        )
         return
 
     if data == "my_trades":

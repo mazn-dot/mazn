@@ -118,3 +118,58 @@ def list_open_text():
             f"   TP: {t['tp1']:.6g} / {t['tp2']:.6g} / {t['tp3']:.6g}"
         )
     return "\n\n".join(lines)
+
+
+def get_all_trades(limit=50):
+    init()
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def report_text(limit=40):
+    """تقرير مختصر: اسم العملة + ربح/خسارة"""
+    trades = get_all_trades(limit)
+    if not trades:
+        return "لا يوجد سجل صفقات."
+
+    lines = ["📊 <b>تقرير الصفقات</b>", ""]
+    wins = losses = open_n = 0
+    total_pnl = 0.0
+
+    for t in trades:
+        sym = t.get("symbol") or "?"
+        status = t.get("status") or ""
+        entry = float(t.get("entry_price") or 0)
+        close_p = t.get("close_price")
+        pnl = t.get("pnl_pct")
+        size = float(t.get("size_usd") or 0)
+
+        if status == "open":
+            open_n += 1
+            # حالة مفتوحة
+            tp_hits = int(t.get("tp1_hit") or 0) + int(t.get("tp2_hit") or 0) + int(t.get("tp3_hit") or 0)
+            extra = f" | أهداف {tp_hits}/3" if tp_hits else ""
+            lines.append(f"⏳ <b>{sym}</b> — مفتوحة{extra}")
+            continue
+
+        if pnl is None and close_p and entry:
+            pnl = ((float(close_p) - entry) / entry) * 100
+        pnl = float(pnl or 0)
+        usd = size * (pnl / 100.0)
+        total_pnl += usd
+
+        if pnl >= 0:
+            wins += 1
+            lines.append(f"✅ <b>{sym}</b> — ربح {pnl:.1f}% (~{usd:+.2f}$)")
+        else:
+            losses += 1
+            lines.append(f"❌ <b>{sym}</b> — خسارة {pnl:.1f}% (~{usd:.2f}$)")
+
+    lines.append("")
+    lines.append("────────────")
+    lines.append(f"مفتوحة: {open_n} | رابحة: {wins} | خاسرة: {losses}")
+    lines.append(f"صافي تقديري (المقفلة): <b>{total_pnl:+.2f}$</b>")
+    return "\n".join(lines)

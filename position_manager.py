@@ -3,6 +3,7 @@
 - وقف خسارة
 - 3 أهداف تيك بروفت (بيع تدريجي)
 - رفع وقف الخسارة بعد كل هدف (Trailing / Break-even)
+- رسائل مختصرة وواضحة
 """
 import asyncio
 import logging
@@ -14,11 +15,22 @@ import mexc_trade
 
 log = logging.getLogger(__name__)
 
+_no_price_count = {}  # trade_id -> consecutive failures
+
 
 def _update_sl(trade_id, new_sl):
-    """يرفع وقف الخسارة في قاعدة البيانات"""
     with trades_db.db() as c:
         c.execute("UPDATE trades SET stop_loss=? WHERE id=?", (new_sl, trade_id))
+
+
+def _pnl_pct(entry, exit_price):
+    if not entry:
+        return 0.0
+    return ((exit_price - entry) / entry) * 100.0
+
+
+def _pnl_usd(entry, exit_price, size_usd, fraction=1.0):
+    return size_usd * fraction * (_pnl_pct(entry, exit_price) / 100.0)
 
 
 async def check_positions(app):
@@ -32,36 +44,59 @@ async def check_positions(app):
         price = mexc_trade.get_price(pair)
         if price <= 0:
             log.warning("No price for %s", pair)
+            _no_price_count[trade_id] = _no_price_count.get(trade_id, 0) + 1
+            # بعد 15 محاولة فاشلة (~5 دقايق) نقفل الصفقة كـ invalid
+            if _no_price_count[trade_id] >= 15:
+                trades_db.close_trade(trade_id, entry, note="invalid_symbol")
+                await _notify(app, f"⚠️ <b>{symbol}</b> اتقفلت — الزوج غير متاح على MEXC")
+                _no_price_count.pop(trade_id, None)
             continue
+        else:
+            _no_price_count.pop(trade_id, None)
 
         entry = t["entry_price"]
         qty = t["quantity"]
         trade_id = t["id"]
         sl = t["stop_loss"]
+        size = float(t.get("size_usd") or 0)
+        tp1_hit = t.get("tp1_hit") or 0
+        tp2_hit = t.get("tp2_hit") or 0
+        tp3_hit = t.get("tp3_hit") or 0
+        targets_hit = int(tp1_hit) + int(tp2_hit) + int(tp3_hit)
 
         # ---------- Stop Loss ----------
         if sl and price <= sl:
             log.info("SL hit for #%s %s @ %s (SL=%s)", trade_id, symbol, price, sl)
-            # استخدم الرصيد الفعلي لو متاح عشان نتجنب quantity scale errors
             real_bal = mexc_trade.get_base_balance(pair)
             sell_qty = real_bal if real_bal > 0 else qty
             result = mexc_trade.market_sell(pair, sell_qty)
+            pnl_p = _pnl_pct(entry, price)
+            # تقدير الربح/الخسارة على المتبقي
+            remaining_frac = max(0.15, 1.0 - (targets_hit / 3.0))
+            pnl_u = _pnl_usd(entry, price, size, remaining_frac)
             trades_db.close_trade(trade_id, price, note="StopLoss")
-            await _notify(
-                app,
-                f"🛑 <b>وقف خسارة</b>\n"
-                f"#{trade_id} <b>{symbol}</b>\n"
-                f"دخول: {entry:.6g} → خروج: {price:.6g}\n"
-                f"{result}",
-            )
+
+            if targets_hit == 0:
+                msg = (
+                    f"للأسف تم ضرب وقف الخسارة\n"
+                    f"<b>{symbol}</b>\n"
+                    f"الخسارة ≈ <b>{pnl_u:.2f}$</b> ({pnl_p:.1f}%)"
+                )
+            else:
+                msg = (
+                    f"تم ضرب الاستوب بعد ما اتحقق <b>{targets_hit}</b> هدف\n"
+                    f"<b>{symbol}</b>\n"
+                    f"نتيجة الجزء المتبقي ≈ <b>{pnl_u:.2f}$</b> ({pnl_p:.1f}%)\n"
+                    f"الأهداف اللي اتحققت قبل الاستوب: {targets_hit}/3"
+                )
+            await _notify(app, msg)
             continue
 
-        # ---------- Take Profits + رفع الـ SL ----------
-        # المستوى: (رقم الهدف، سعر الهدف، هل اتحقق قبل كده)
+        # ---------- Take Profits ----------
         levels = [
-            (1, t["tp1"], t["tp1_hit"]),
-            (2, t["tp2"], t["tp2_hit"]),
-            (3, t["tp3"], t["tp3_hit"]),
+            (1, t["tp1"], tp1_hit),
+            (2, t["tp2"], tp2_hit),
+            (3, t["tp3"], tp3_hit),
         ]
 
         for level, tp_price, already_hit in levels:
@@ -70,8 +105,7 @@ async def check_positions(app):
             if price < tp_price:
                 continue
 
-            # بيع جزء من الكمية (تقريباً ثلث)
-            parts_left = 4 - level  # 3, 2, 1
+            parts_left = 4 - level
             sell_qty = round(qty / parts_left, 6)
             if sell_qty <= 0:
                 continue
@@ -80,41 +114,34 @@ async def check_positions(app):
             result = mexc_trade.market_sell(pair, sell_qty)
             trades_db.mark_tp(trade_id, level)
 
-            # === رفع وقف الخسارة (الأهم) ===
+            frac = 1.0 / 3.0
+            pnl_u = _pnl_usd(entry, price, size, frac)
+            pnl_p = _pnl_pct(entry, price)
+
+            # رفع SL
             if level == 1:
-                # بعد الهدف 1 → SL على سعر الدخول (Break Even)
                 new_sl = entry
-                reason = "رفع SL لسعر الدخول (Break Even)"
             elif level == 2:
-                # بعد الهدف 2 → SL على سعر الهدف 1
                 new_sl = t["tp1"] if t["tp1"] else entry
-                reason = "رفع SL لمستوى الهدف 1"
             else:
-                # بعد الهدف 3 → قفل الصفقة بالكامل
                 new_sl = None
-                reason = "كل الأهداف تحققت"
 
             if level < 3 and new_sl:
-                # نتأكد إن الـ SL الجديد أعلى من القديم (نرفع فقط)
                 if sl is None or new_sl > sl:
                     _update_sl(trade_id, new_sl)
                     sl = new_sl
 
-            await _notify(
-                app,
-                f"🎯 <b>هدف {level} تحقق</b>\n"
-                f"#{trade_id} <b>{symbol}</b> @ {price:.6g}\n"
-                f"كمية مباعة: {sell_qty}\n"
-                f"🔒 {reason}\n"
-                f"وقف الخسارة الجديد: <b>{new_sl if new_sl else '— (صفقة مقفلة)'}</b>\n"
-                f"{result}",
+            msg = (
+                f"مبروك 🎯 تم تحقيق هدف {level}\n"
+                f"<b>{symbol}</b>\n"
+                f"ربح صافي ≈ <b>+{pnl_u:.2f}$</b> ({pnl_p:.1f}%)"
             )
+            await _notify(app, msg)
 
             if level == 3:
                 trades_db.close_trade(trade_id, price, note="TP3 complete")
-                await _notify(app, f"✅ الصفقة #{trade_id} <b>{symbol}</b> اتقفلت بالكامل")
+                await _notify(app, f"✅ <b>{symbol}</b> اتقفلت — كل الأهداف تحققت")
 
-            # بعد ما نبيع جزء، نقلل الكمية المحلية للدورة دي
             qty = max(0, qty - sell_qty)
 
 
@@ -130,7 +157,7 @@ async def _notify(app, text):
 
 
 async def position_loop(app):
-    log.info("Position manager started (with trailing SL)")
+    log.info("Position manager started (clean messages)")
     await asyncio.sleep(15)
     while True:
         try:
