@@ -1,0 +1,10 @@
+{
+  "trade_size_usd": 33,
+  "stop_loss_pct": -8.0,
+  "tp1_pct": 5.0,
+  "tp2_pct": 10.0,
+  "tp3_pct": 15.0,
+  "max_open_trades": 3,
+  "monitoring_enabled": false,
+  "auto_buy_enabled": false
+}

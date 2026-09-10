@@ -3,7 +3,7 @@ import os
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TOP_N = 10
-MIN_TRANSFERS = 3
+MIN_TRANSFERS = 10
 
 # Continuous monitoring (free-friendly)
 MONITOR_INTERVAL_SEC = 300          # كل 5 دقايق

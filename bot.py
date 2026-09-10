@@ -76,6 +76,10 @@ def main_keyboard():
             ],
             [
                 InlineKeyboardButton("📋 صفقاتي", callback_data="my_trades"),
+                InlineKeyboardButton("💰 رصيدي", callback_data="show_balance"),
+            ],
+            [
+                InlineKeyboardButton("🛑 بيع كل الصفقات", callback_data="sell_all"),
             ],
         ]
     )
@@ -287,6 +291,59 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = settings.get("auto_buy_enabled")
         settings.set_value("auto_buy_enabled", not cur)
         await query.edit_message_text(settings.text(), reply_markup=_settings_keyboard(), **KW)
+        return
+
+    if data == "show_balance":
+        import mexc_trade
+        try:
+            usdt = mexc_trade.get_balance("USDT")
+            msg = f"💰 <b>الرصيد المتاح</b>\n\nUSDT: <b>{usdt:.2f}$</b>"
+        except Exception as e:
+            msg = f"❌ فشل جلب الرصيد: {e}"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]),
+            **KW,
+        )
+        return
+
+    if data == "sell_all":
+        # تأكيد أولاً
+        await query.edit_message_text(
+            "⚠️ <b>هل أنت متأكد من بيع كل الصفقات المفتوحة؟</b>",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ نعم، بيع الكل", callback_data="sell_all_confirm"),
+                    InlineKeyboardButton("❌ إلغاء", callback_data="back"),
+                ]
+            ]),
+            **KW,
+        )
+        return
+
+    if data == "sell_all_confirm":
+        import mexc_trade
+        trades = trades_db.get_open_trades()
+        if not trades:
+            await query.edit_message_text(
+                "لا توجد صفقات مفتوحة.",
+                reply_markup=main_keyboard(),
+                **KW,
+            )
+            return
+        results = []
+        for t in trades:
+            pair = mexc_trade.resolve_symbol(t["symbol"])
+            price = mexc_trade.get_price(pair)
+            qty = t["quantity"]
+            # خصم الكميات اللي اتباعت في أهداف سابقة بشكل تقريبي
+            # نبيع الكمية المتبقية المسجلة
+            order = mexc_trade.market_sell(pair, qty)
+            close_price = price if price > 0 else t["entry_price"]
+            pnl = trades_db.close_trade(t["id"], close_price, note="SellAll")
+            results.append(f"#{t['id']} {t['symbol']}: PnL ≈ {pnl:.1f}%" if pnl is not None else f"#{t['id']} {t['symbol']}: {order}")
+        msg = "🛑 <b>تم إغلاق كل الصفقات</b>\n\n" + "\n".join(results)
+        await query.edit_message_text(msg, reply_markup=main_keyboard(), **KW)
         return
 
     if data == "my_trades":

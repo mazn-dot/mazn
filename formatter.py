@@ -113,7 +113,8 @@ def format_report(data, direction, minutes):
                     combined[ckey]["amount"] += t.get("amount", 0)
                     combined[ckey]["count"] += t.get("count", 0)
                     combined[ckey]["score"] = combined[ckey].get("score", 0) + t.get("score", 0)
-        tokens = sorted(combined.values(), key=lambda x: x.get("score", x.get("amount", 0)), reverse=True)[:TOP_N]
+        tokens = [t for t in combined.values() if t.get("count", 0) >= MIN_TRANSFERS]
+        tokens = sorted(tokens, key=lambda x: x.get("score", x.get("amount", 0)), reverse=True)[:TOP_N]
         for t in tokens:
             if "reason" not in t:
                 from tracker import build_reason
