@@ -37,6 +37,16 @@ def _pnl_pct(entry, exit_price):
     return ((exit_price - entry) / entry) * 100.0
 
 
+def _trade_quantity(trade):
+    """Read quantity from current and legacy trade schemas."""
+    return float(
+        trade.get("quantity")
+        or trade.get("qty")
+        or trade.get("amount")
+        or 0
+    )
+
+
 def _pnl_usd(entry, exit_price, size_usd, fraction=1.0):
     return size_usd * fraction * (_pnl_pct(entry, exit_price) / 100.0)
 
@@ -129,7 +139,7 @@ async def _check_one(app, t):
     pair = mexc_trade.resolve_symbol(symbol)
     trade_id = t["id"]
     entry = float(t["entry_price"] or 0)
-    qty = float(t["quantity"] or 0)
+    qty = _trade_quantity(t)
     sl = t["stop_loss"]
     size = float(t.get("size_usd") or 0)
     tp1_hit = int(t.get("tp1_hit") or 0)

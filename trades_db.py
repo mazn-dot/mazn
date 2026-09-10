@@ -6,6 +6,7 @@ import os
 import time
 import json
 import logging
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
@@ -130,6 +131,13 @@ def _sqlite():
 def _ensure_trade_columns(kind, c):
     """Upgrade older deployments without deleting existing trade history."""
     expected = {
+        "entry_price": ("DOUBLE PRECISION", "REAL"),
+        "quantity": ("DOUBLE PRECISION", "REAL"),
+        "size_usd": ("DOUBLE PRECISION", "REAL"),
+        "stop_loss": ("DOUBLE PRECISION", "REAL"),
+        "tp1": ("DOUBLE PRECISION", "REAL"),
+        "tp2": ("DOUBLE PRECISION", "REAL"),
+        "tp3": ("DOUBLE PRECISION", "REAL"),
         "side": ("TEXT DEFAULT 'buy'", "TEXT DEFAULT 'buy'"),
         "contract": ("TEXT", "TEXT"),
         "chain": ("TEXT", "TEXT"),
@@ -140,6 +148,8 @@ def _ensure_trade_columns(kind, c):
         "close_price": ("DOUBLE PRECISION", "REAL"),
         "pnl_pct": ("DOUBLE PRECISION", "REAL"),
         "note": ("TEXT", "TEXT"),
+        "status": ("TEXT DEFAULT 'open'", "TEXT DEFAULT 'open'"),
+        "opened_at": ("DOUBLE PRECISION", "REAL"),
     }
     if kind == "pg":
         c.execute("SELECT column_name FROM information_schema.columns WHERE table_name=%s", ("trades",))
@@ -153,6 +163,22 @@ def _ensure_trade_columns(kind, c):
         if column not in present:
             c.execute(f"ALTER TABLE trades ADD COLUMN {column} {types[type_index]}")
             log.warning("Added missing trades.%s column", column)
+
+
+def _timestamp_value(kind, c, column):
+    """Match the value type of legacy PostgreSQL timestamp columns."""
+    if kind != "pg":
+        return time.time()
+    c.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name=%s AND column_name=%s",
+        ("trades", column),
+    )
+    row = c.fetchone()
+    data_type = row["data_type"] if hasattr(row, "keys") else (row[0] if row else "")
+    if data_type and "timestamp" in str(data_type):
+        return datetime.now(timezone.utc)
+    return time.time()
 
 
 @contextmanager
@@ -308,7 +334,7 @@ def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
                  stop_loss, tp1, tp2, tp3, opened_at, note, status)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') RETURNING id""",
                 (symbol, contract, chain, entry_price, quantity, size_usd,
-                 stop_loss, tp1, tp2, tp3, time.time(), note),
+                 stop_loss, tp1, tp2, tp3, _timestamp_value(kind, c, "opened_at"), note),
             )
             row = c.fetchone()
             return row["id"] if hasattr(row, "keys") else row[0]
@@ -318,7 +344,7 @@ def open_trade(symbol, contract, chain, entry_price, quantity, size_usd,
              stop_loss, tp1, tp2, tp3, opened_at, note, status)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
             (symbol, contract, chain, entry_price, quantity, size_usd,
-             stop_loss, tp1, tp2, tp3, time.time(), note),
+             stop_loss, tp1, tp2, tp3, _timestamp_value(kind, c, "opened_at"), note),
         )
         return cur.lastrowid
 
@@ -350,13 +376,13 @@ def close_trade(trade_id, close_price, note=""):
             c.execute(
                 """UPDATE trades SET status='closed', closed_at=%s, close_price=%s,
                    pnl_pct=%s, note=%s WHERE id=%s""",
-                (time.time(), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
+                (_timestamp_value(kind, c, "closed_at"), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
             )
         else:
             c.execute(
                 """UPDATE trades SET status='closed', closed_at=?, close_price=?,
                    pnl_pct=?, note=? WHERE id=?""",
-                (time.time(), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
+                (_timestamp_value(kind, c, "closed_at"), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
             )
         return pnl
 

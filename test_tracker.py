@@ -49,9 +49,9 @@ class TrackerV3Tests(unittest.TestCase):
         self.assertEqual(report["Wallet"]["tokens"][0]["count"], 10)
         self.assertEqual(opportunity["ranked"][0]["symbol"], "ABC")
 
-    def test_less_than_ten_is_filtered(self):
-        self.assertEqual(tracker.top_from_raw(self.sample(count=9)), [])
-        self.assertEqual(len(tracker.top_from_raw(self.sample(count=10))), 1)
+    def test_less_than_three_is_filtered(self):
+        self.assertEqual(tracker.top_from_raw(self.sample(count=2)), [])
+        self.assertEqual(len(tracker.top_from_raw(self.sample(count=3))), 1)
 
 
 if __name__ == "__main__":

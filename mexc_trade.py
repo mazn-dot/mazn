@@ -49,7 +49,11 @@ def _request(method, path, params=None, signed=False):
 
 
 def resolve_symbol(token_symbol: str) -> str:
-    return token_symbol.upper().replace(" ", "") + "USDT"
+    symbol = str(token_symbol or "").upper().replace(" ", "").replace("-", "")
+    symbol = symbol.split("/", 1)[0]
+    if symbol.endswith("USDT"):
+        symbol = symbol[:-4]
+    return symbol + "USDT"
 
 
 def get_price(symbol: str) -> float:
