@@ -101,10 +101,7 @@ def try_auto_buy(symbol, contract="", chain="", note="سحب جماعي"):
 
     msg = (
         f"✅ تم الشراء #{trade_id}\n"
-        f"<b>{symbol}</b> @ {price:.6g}\n"
-        f"حجم: {size}$ | كمية ≈ {qty:.4f}\n"
-        f"SL: {stop_loss:.6g}\n"
-        f"TP: {tp1:.6g} / {tp2:.6g} / {tp3:.6g}"
+        f"<b>{symbol}</b> | حجم {size:.0f}$"
     )
     log.info("Auto-buy success: %s", msg)
     return True, msg

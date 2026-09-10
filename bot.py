@@ -752,7 +752,16 @@ def main():
     async def post_init(application: Application):
         import trades_db
         trades_db.init()  # تحميل/إنشاء جداول الصفقات والإعدادات
-        log.info("DB ready | open trades: %s", trades_db.count_open())
+        try:
+            from migrate_old import import_old_trades
+            n = import_old_trades()
+            if n:
+                log.info("Imported %s old trades", n)
+        except Exception as e:
+            log.warning("migrate_old skip: %s", e)
+        log.info("DB ready | mode=%s | open trades: %s",
+                 "postgres" if trades_db.USE_PG else "sqlite",
+                 trades_db.count_open())
         from position_manager import position_loop
         application.create_task(continuous_monitor(application))
         application.create_task(position_loop(application))
