@@ -49,6 +49,23 @@ def authorized(update):
     return bool(chat and str(chat.id) == TELEGRAM_CHAT_ID)
 
 
+def order_failed(order):
+    """Return True when an exchange response cannot be treated as a filled order."""
+    if not isinstance(order, dict):
+        return True
+    if order.get("error"):
+        return True
+    code = order.get("code")
+    if code is not None:
+        try:
+            if int(code) not in (0, 200):
+                return True
+        except (TypeError, ValueError):
+            return True
+    status = str(order.get("status", "")).upper()
+    return status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+
+
 def main_keyboard():
     mon = settings.get("monitoring_enabled")
     mon_btn = "⏹ إيقاف الرصد" if mon else "▶️ تشغيل الرصد"
@@ -317,7 +334,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winners, losers = [], []
         for t in trades:
             pair = mexc_trade.resolve_symbol(t["symbol"])
-            price = mexc_trade.get_price(pair)
+            price = await asyncio.to_thread(mexc_trade.get_price, pair)
             entry = float(t["entry_price"] or 0)
             if price <= 0 or entry <= 0:
                 continue
@@ -344,9 +361,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         closed = 0
         for t, price, pnl in targets:
             pair = mexc_trade.resolve_symbol(t["symbol"])
-            real_bal = mexc_trade.get_base_balance(pair)
+            real_bal = await asyncio.to_thread(mexc_trade.get_base_balance, pair)
             qty = real_bal if real_bal > 0 else float(t["quantity"] or 0)
-            order = mexc_trade.market_sell(pair, qty)
+            order = await asyncio.to_thread(mexc_trade.market_sell, pair, qty)
+            if order_failed(order):
+                results.append(f"⚠️ <b>{t['symbol']}</b> فشل البيع ولم تُغلق في السجل")
+                continue
             trades_db.close_trade(t["id"], price, note=f"Close{label}")
             closed += 1
             sign = "+" if pnl >= 0 else ""
@@ -364,7 +384,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "show_balance":
         import mexc_trade
         try:
-            usdt = mexc_trade.get_balance("USDT")
+            usdt = await asyncio.to_thread(mexc_trade.get_balance, "USDT")
             msg = f"💰 <b>الرصيد المتاح</b>\n\nUSDT: <b>{usdt:.2f}$</b>"
         except Exception as e:
             msg = f"❌ فشل جلب الرصيد: {e}"
@@ -402,11 +422,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = []
         for t in trades:
             pair = mexc_trade.resolve_symbol(t["symbol"])
-            price = mexc_trade.get_price(pair)
+            price = await asyncio.to_thread(mexc_trade.get_price, pair)
             qty = t["quantity"]
             # خصم الكميات اللي اتباعت في أهداف سابقة بشكل تقريبي
             # نبيع الكمية المتبقية المسجلة
-            order = mexc_trade.market_sell(pair, qty)
+            order = await asyncio.to_thread(mexc_trade.market_sell, pair, qty)
+            if order_failed(order):
+                results.append(f"⚠️ #{t['id']} {t['symbol']}: فشل البيع وبقيت مفتوحة")
+                continue
             close_price = price if price > 0 else t["entry_price"]
             pnl = trades_db.close_trade(t["id"], close_price, note="SellAll")
             results.append(f"#{t['id']} {t['symbol']}: PnL ≈ {pnl:.1f}%" if pnl is not None else f"#{t['id']} {t['symbol']}: {order}")
@@ -724,7 +747,8 @@ async def continuous_monitor(app):
                     log.info("ALERT sent for %s (%s)", symbol, ckey)
 
                     # شراء تلقائي عند الفرصة
-                    ok, buy_msg = try_auto_buy(
+                    ok, buy_msg = await asyncio.to_thread(
+                        try_auto_buy,
                         symbol=symbol,
                         contract=contract,
                         chain=chain,

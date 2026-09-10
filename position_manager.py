@@ -17,9 +17,18 @@ NO_PRICE_LIMIT = 8         # ~2-3 دقايق
 SELL_FAIL_LIMIT = 3        # 3 محاولات بيع فاشلة
 
 
+async def _exchange_call(fn, *args, **kwargs):
+    """Run blocking exchange I/O away from Telegram's asyncio event loop."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 def _update_sl(trade_id, new_sl):
-    with trades_db.db() as c:
-        c.execute("UPDATE trades SET stop_loss=? WHERE id=?", (new_sl, trade_id))
+    with trades_db.db() as (kind, c):
+        placeholder = "%s" if kind == "pg" else "?"
+        c.execute(
+            f"UPDATE trades SET stop_loss={placeholder} WHERE id={placeholder}",
+            (new_sl, trade_id),
+        )
 
 
 def _pnl_pct(entry, exit_price):
@@ -52,15 +61,15 @@ async def emergency_close(app, t, reason, price=None):
     pair = mexc_trade.resolve_symbol(symbol)
 
     if price is None or price <= 0:
-        price = mexc_trade.get_price(pair) or entry
+        price = await _exchange_call(mexc_trade.get_price, pair) or entry
 
     sell_result = None
     sell_ok = False
     try:
-        real_bal = mexc_trade.get_base_balance(pair)
+        real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
         qty = real_bal if real_bal > 0 else float(t.get("quantity") or 0)
         if qty > 0:
-            sell_result = mexc_trade.market_sell(pair, qty)
+            sell_result = await _exchange_call(mexc_trade.market_sell, pair, qty)
             bad, _ = _is_bad_order(sell_result)
             sell_ok = not bad
         else:
@@ -74,11 +83,14 @@ async def emergency_close(app, t, reason, price=None):
     pnl_p = _pnl_pct(entry, price) if price and entry else 0
     pnl_u = _pnl_usd(entry, price, size, 1.0) if price and entry else 0
 
-    trades_db.close_trade(
-        trade_id,
-        price or entry,
-        note=f"EMERGENCY: {reason}",
-    )
+    if sell_ok:
+        trades_db.close_trade(
+            trade_id,
+            price or entry,
+            note=f"EMERGENCY: {reason}",
+        )
+    else:
+        log.error("Keeping trade #%s open because emergency sell failed", trade_id)
     _no_price_count.pop(trade_id, None)
     _sell_fail_count.pop(trade_id, None)
 
@@ -127,7 +139,7 @@ async def _check_one(app, t):
 
     # ---- سعر ----
     try:
-        price = mexc_trade.get_price(pair)
+        price = await _exchange_call(mexc_trade.get_price, pair)
     except Exception as e:
         price = 0
         log.warning("price exception %s: %s", pair, e)
@@ -147,9 +159,9 @@ async def _check_one(app, t):
     # ---- وقف الخسارة ----
     if sl and price <= float(sl):
         log.info("SL hit for #%s %s @ %s (SL=%s)", trade_id, symbol, price, sl)
-        real_bal = mexc_trade.get_base_balance(pair)
+        real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
         sell_qty = real_bal if real_bal > 0 else qty
-        result = mexc_trade.market_sell(pair, sell_qty)
+        result = await _exchange_call(mexc_trade.market_sell, pair, sell_qty)
         bad, why = _is_bad_order(result)
         if bad:
             _sell_fail_count[trade_id] = _sell_fail_count.get(trade_id, 0) + 1
@@ -198,7 +210,7 @@ async def _check_one(app, t):
             continue
 
         log.info("TP%s hit for #%s %s @ %s", level, trade_id, symbol, price)
-        result = mexc_trade.market_sell(pair, sell_qty)
+        result = await _exchange_call(mexc_trade.market_sell, pair, sell_qty)
         bad, why = _is_bad_order(result)
         if bad:
             _sell_fail_count[trade_id] = _sell_fail_count.get(trade_id, 0) + 1

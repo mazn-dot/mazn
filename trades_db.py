@@ -10,8 +10,8 @@ from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
-DB_SQLITE = os.path.join(os.path.dirname(__file__), "data", "trades.db")
-os.makedirs(os.path.dirname(DB_SQLITE), exist_ok=True)
+DB_SQLITE = os.getenv("SQLITE_DB_PATH", os.path.join(os.path.dirname(__file__), "trades.db"))
+os.makedirs(os.path.dirname(os.path.abspath(DB_SQLITE)), exist_ok=True)
 
 DEFAULT_SETTINGS = {
     "trade_size_usd": 20.0,
@@ -120,9 +120,39 @@ def use_postgres():
 
 def _sqlite():
     import sqlite3
-    c = sqlite3.connect(DB_SQLITE)
+    c = sqlite3.connect(DB_SQLITE, timeout=30)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA journal_mode=WAL")
     return c
+
+
+def _ensure_trade_columns(kind, c):
+    """Upgrade older deployments without deleting existing trade history."""
+    expected = {
+        "side": ("TEXT DEFAULT 'buy'", "TEXT DEFAULT 'buy'"),
+        "contract": ("TEXT", "TEXT"),
+        "chain": ("TEXT", "TEXT"),
+        "tp1_hit": ("INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+        "tp2_hit": ("INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+        "tp3_hit": ("INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+        "closed_at": ("DOUBLE PRECISION", "REAL"),
+        "close_price": ("DOUBLE PRECISION", "REAL"),
+        "pnl_pct": ("DOUBLE PRECISION", "REAL"),
+        "note": ("TEXT", "TEXT"),
+    }
+    if kind == "pg":
+        c.execute("SELECT column_name FROM information_schema.columns WHERE table_name=%s", ("trades",))
+        present = {r["column_name"] if hasattr(r, "keys") else r[0] for r in c.fetchall()}
+        type_index = 0
+    else:
+        c.execute("PRAGMA table_info(trades)")
+        present = {r[1] for r in c.fetchall()}
+        type_index = 1
+    for column, types in expected.items():
+        if column not in present:
+            c.execute(f"ALTER TABLE trades ADD COLUMN {column} {types[type_index]}")
+            log.warning("Added missing trades.%s column", column)
 
 
 @contextmanager
@@ -200,6 +230,7 @@ def init():
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (k, json.dumps(v)),
                 )
+        _ensure_trade_columns(kind, c)
     # تشخيص: أسماء متغيرات DB الموجودة
     db_keys = [k for k in os.environ if "DATABASE" in k.upper() or "POSTGRES" in k.upper() or "PG" == k[:2].upper()]
     log.info("DB env keys present: %s", db_keys)
