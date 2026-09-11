@@ -551,9 +551,31 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.update(prefix=prefix, minutes=minutes)
-    await query.edit_message_text("⏳ جارٍ التحليل…", **KW)
-    text, markup = await fetch(prefix, minutes)
-    await query.edit_message_text(text, reply_markup=markup, **KW)
+    n_wallets = len(store.get_all())
+    await query.edit_message_text(
+        f"⏳ جارٍ التحليل…\n"
+        f"المحافظ: {n_wallets} · الفترة: {minutes or 'متعدد'} د\n"
+        f"<i>الشبكات المجانية قد تأخذ 15–60 ثانية</i>",
+        **KW,
+    )
+    try:
+        # Cap wait so Telegram never looks permanently frozen
+        text, markup = await asyncio.wait_for(fetch(prefix, minutes), timeout=90)
+        await query.edit_message_text(text, reply_markup=markup, **KW)
+    except asyncio.TimeoutError:
+        await query.edit_message_text(
+            "⏱ انتهى الوقت قبل اكتمال التحليل (RPC بطيء أو محدود).\n"
+            "جرّب فترة أقصر (5–15 دقيقة) أو قلّل عدد المحافظ.",
+            reply_markup=main_keyboard(),
+            **KW,
+        )
+    except Exception as e:
+        log.exception("fetch failed: %s", e)
+        await query.edit_message_text(
+            f"❌ فشل التحليل: {e}\nجرّب مرة أخرى أو فترة أقصر.",
+            reply_markup=main_keyboard(),
+            **KW,
+        )
 
 
 async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):

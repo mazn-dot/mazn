@@ -163,11 +163,16 @@ def transfers_on_chain(chain_id, address, direction, minutes, cap=1200):
         return {}
     latest = uint(latest_hex)
     bpm = cfg.get("blocks_per_min", 15)
-    start = max(0, latest - min(max(1, int(minutes * bpm)), 30000))
+    # Cap lookback so long windows (12h/24h) don't freeze the bot on free RPCs.
+    # ~12k blocks ≈ 10h BSC / ~6.5h Base — enough for opportunity scans.
+    max_blocks = 12000
+    start = max(0, latest - min(max(1, int(minutes * bpm)), max_blocks))
     raw = defaultdict(lambda: {"raw_amount": 0, "count": 0})
     processed = 0
-    for end in range(latest, start - 1, -1500):
-        begin = max(start, end - 1499)
+    # Larger chunk size = fewer RPC round-trips on free endpoints
+    chunk = 2000
+    for end in range(latest, start - 1, -chunk):
+        begin = max(start, end - (chunk - 1))
         for event in transfer_logs(chain_id, address, direction, begin, end):
             contract = (event.get("address") or "").lower()
             if not contract:
@@ -298,17 +303,29 @@ def get_report(minutes, direction, wallets=None, chains=None):
     chains = chains or ACTIVE_CHAINS
     out = {"_meta": {"minutes": minutes, "source": "multi_rpc", "chains": chains}}
     combined = {}
-    for label, address in wallets.items():
-        raw = transfers_multi(address, direction, minutes, chains)
-        for key, info in raw.items():
-            ckey = "%s:%s" % (info["chain"], info["contract"])
-            if ckey not in combined:
-                combined[ckey] = dict(info)
-            else:
-                combined[ckey]["amount"] += info["amount"]
-                combined[ckey]["count"] += info["count"]
-                combined[ckey]["score"] += info.get("score", info["amount"])
-        out[label] = {"tokens": top_from_raw(raw), "source": "multi_rpc"}
+    items = list((wallets or {}).items())
+    # Parallel wallet scans — sequential scanning froze the bot for minutes.
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(items)))) as pool:
+        futures = {
+            pool.submit(transfers_multi, address, direction, minutes, chains): label
+            for label, address in items
+        }
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                raw = fut.result()
+            except Exception as e:
+                log.warning("wallet %s report failed: %s", label, e)
+                raw = {}
+            for key, info in raw.items():
+                ckey = "%s:%s" % (info["chain"], info["contract"])
+                if ckey not in combined:
+                    combined[ckey] = dict(info)
+                else:
+                    combined[ckey]["amount"] += info["amount"]
+                    combined[ckey]["count"] += info["count"]
+                    combined[ckey]["score"] += info.get("score", info["amount"])
+            out[label] = {"tokens": top_from_raw(raw), "source": "multi_rpc"}
     out["_combined"] = top_from_raw(combined)
     return out
 
@@ -336,14 +353,34 @@ def merge_multi(raws):
     return out
 
 
+def _scan_wallets_parallel(wallets, direction, minutes, chains):
+    """Scan all wallets in parallel to avoid freezing interactive buttons."""
+    items = list((wallets or {}).items())
+    raws = {}
+    if not items:
+        return raws
+    workers = min(6, max(1, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(transfers_multi, address, direction, minutes, chains): label
+            for label, address in items
+        }
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                raws[label] = fut.result()
+            except Exception as e:
+                log.warning("wallet %s %s scan failed: %s", label, direction, e)
+                raws[label] = {}
+    return raws
+
+
 def get_opportunity(minutes, wallets=None, chains=None):
     if wallets is None:
         import wallets as wm
         wallets = wm.get_all()
     chains = chains or ACTIVE_CHAINS
-    raws = {
-        label: transfers_multi(address, "out", minutes, chains) for label, address in wallets.items()
-    }
+    raws = _scan_wallets_parallel(wallets, "out", minutes, chains)
     merged = merge_multi(raws)
     ranked = top_from_raw(merged)
     return {
@@ -358,12 +395,12 @@ def get_clean_opportunity(minutes, wallets=None, chains=None):
         import wallets as wm
         wallets = wm.get_all()
     chains = chains or ACTIVE_CHAINS
-    outs = {
-        label: transfers_multi(address, "out", minutes, chains) for label, address in wallets.items()
-    }
-    ins = {
-        label: transfers_multi(address, "in", minutes, chains) for label, address in wallets.items()
-    }
+    # Run out + in scans in parallel (was sequential → felt frozen)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_out = pool.submit(_scan_wallets_parallel, wallets, "out", minutes, chains)
+        fut_in = pool.submit(_scan_wallets_parallel, wallets, "in", minutes, chains)
+        outs = fut_out.result()
+        ins = fut_in.result()
     incoming = merge_multi(ins)
     clean, tainted = [], []
     for x in merge_multi(outs).values():
