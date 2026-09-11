@@ -98,9 +98,29 @@ def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
         note=note,
     )
 
+    # رابط TradingView للزوج على MEXC
+    tv_symbol = pair  # مثلاً BREWUSDT
+    tv_url = f"https://www.tradingview.com/chart/?symbol=MEXC:{tv_symbol}"
+
+    def _fmt(p):
+        if p is None or p <= 0:
+            return "—"
+        if p >= 1:
+            return f"{p:.6g}"
+        return f"{p:.8f}".rstrip("0").rstrip(".")
+
     msg = (
-        f"✅ تم الشراء #{trade_id}\n"
-        f"<b>{symbol}</b> | حجم {size:.0f}$"
+        f"✅ <b>اشتريتلك</b> #{trade_id}\n"
+        f"<b>{symbol.upper()}</b>\n"
+        f"السعر: <b>{_fmt(price)}</b>\n"
+        f"الحجم: <b>{size:.0f}$</b>\n\n"
+        f"📊 اذهب راقب صفقتك على TradingView:\n"
+        f"<a href=\"{tv_url}\">{tv_url}</a>\n\n"
+        f"🎯 الأهداف:\n"
+        f"• الهدف 1: <b>{_fmt(tp1)}</b>  (+{s['tp1_pct']:.0f}%)\n"
+        f"• الهدف 2: <b>{_fmt(tp2)}</b>  (+{s['tp2_pct']:.0f}%)\n"
+        f"• الهدف 3: <b>{_fmt(tp3)}</b>  (+{s['tp3_pct']:.0f}%)\n\n"
+        f"🛑 وقف الخسارة: <b>{_fmt(stop_loss)}</b>  ({s['stop_loss_pct']:.0f}%)"
     )
-    log.info("Auto-buy success: %s", msg)
+    log.info("Auto-buy success: #%s %s @ %s", trade_id, symbol, price)
     return True, msg
