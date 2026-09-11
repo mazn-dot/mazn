@@ -50,7 +50,7 @@ def rpc(chain_id, method, params):
             r = requests.post(
                 url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=12,
+                timeout=8,
             )
             if r.status_code == 200:
                 result = r.json().get("result")
@@ -118,7 +118,7 @@ def token_meta(chain_id, contract):
 
     if not symbol or symbol in ("???", ""):
         try:
-            resp = requests.get(DEX + contract.lower(), timeout=12)
+            resp = requests.get(DEX + contract.lower(), timeout=8)
             pairs = (resp.json().get("pairs") or []) if resp.status_code == 200 else []
             dex_slug = CHAINS[chain_id]["dex"]
             preferred = [p for p in pairs if (p.get("chainId") or "").lower() == dex_slug]

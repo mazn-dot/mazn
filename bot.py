@@ -806,7 +806,8 @@ async def continuous_monitor(app):
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(False).build()
+    # Long RPC scans run in executors; keep buttons and /start responsive meanwhile.
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
