@@ -20,9 +20,10 @@ def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
     if not s.get("monitoring_enabled"):
         return False, "الرصد متوقف"
 
-    # مفيش حد أقصى — البوت يتعامل فقط مع صفقاته في قاعدة البيانات
-    # لو في صفقة مفتوحة على نفس العملة — نشتري برضو حسب طلبك
-    # (مش هنمنع)
+    max_open = int(s.get("max_open_trades") or 3)
+    open_count = trades_db.count_open()
+    if open_count >= max_open:
+        return False, f"وصلت لحد الصفقات المفتوحة ({open_count}/{max_open})"
 
     pair = mexc_trade.resolve_symbol(symbol)
     price = mexc_trade.get_price(pair)

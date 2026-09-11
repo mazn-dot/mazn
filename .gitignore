@@ -1,4 +1,11 @@
 __pycache__/
 *.pyc
+*.pyo
+*.db
+trades.db
 wallets.json
+settings.json
 .env
+.venv/
+venv/
+*.log

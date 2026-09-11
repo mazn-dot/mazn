@@ -31,6 +31,16 @@ def _update_sl(trade_id, new_sl):
         )
 
 
+def _update_quantity(trade_id, new_qty):
+    """Persist remaining quantity after a partial take-profit sell."""
+    with trades_db.db() as (kind, c):
+        placeholder = "%s" if kind == "pg" else "?"
+        c.execute(
+            f"UPDATE trades SET quantity={placeholder} WHERE id={placeholder}",
+            (float(new_qty), trade_id),
+        )
+
+
 def _pnl_pct(entry, exit_price):
     if not entry:
         return 0.0
@@ -219,7 +229,17 @@ async def _check_one(app, t):
         if sell_qty <= 0:
             continue
 
-        log.info("TP%s hit for #%s %s @ %s", level, trade_id, symbol, price)
+        # Prefer live exchange balance so partial sells stay accurate after restarts.
+        real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
+        if real_bal > 0:
+            sell_qty = round(min(sell_qty, real_bal / max(1, parts_left)), 6)
+            if level == 3:
+                sell_qty = real_bal  # final TP: dump whatever is left
+
+        if sell_qty <= 0:
+            continue
+
+        log.info("TP%s hit for #%s %s @ %s qty=%s", level, trade_id, symbol, price, sell_qty)
         result = await _exchange_call(mexc_trade.market_sell, pair, sell_qty)
         bad, why = _is_bad_order(result)
         if bad:
@@ -257,8 +277,11 @@ async def _check_one(app, t):
         if level == 3:
             trades_db.close_trade(trade_id, price, note="TP3 complete")
             await _notify(app, f"✅ <b>{symbol}</b> اتقفلت — كل الأهداف تحققت")
-
-        qty = max(0, qty - sell_qty)
+        else:
+            # Keep remaining size in DB so restarts / next checks stay correct.
+            remaining = max(0.0, (real_bal if real_bal > 0 else qty) - sell_qty)
+            _update_quantity(trade_id, remaining)
+            qty = remaining
 
 
 async def _notify(app, text):

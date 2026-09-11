@@ -1,21 +1,19 @@
-import json
-import os
 import re
 
+import trades_db
 from config import DEFAULT_WALLETS
 
-FILE = os.path.join(os.path.dirname(__file__), "wallets.json")
 ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 MAX_WALLETS = 40
 
 
 def load():
-    try:
-        with open(FILE, encoding="utf-8") as f:
-            data = json.load(f)
+    """Load wallets from the persistent DB (PostgreSQL or SQLite)."""
+    data = trades_db.load_wallets()
+    if data:
         return {str(k): str(v) for k, v in data.items() if ADDRESS.match(str(v))}
-    except (OSError, ValueError):
-        return dict(DEFAULT_WALLETS)
+    # First run / empty table — seed defaults (init already seeds, but safe fallback)
+    return dict(DEFAULT_WALLETS)
 
 
 def get_all():
@@ -34,9 +32,7 @@ def add(label, address):
     for existing_label, existing_addr in data.items():
         if existing_addr.lower() == address.lower() and existing_label != label:
             return "العنوان موجود مسبقاً باسم: " + existing_label
-    data[label] = address
-    with open(FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    trades_db.upsert_wallet(label, address)
     return None
 
 
@@ -79,9 +75,7 @@ def remove(label):
         return False
     if len(data) <= 1:
         return False
-    del data[label]
-    with open(FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    trades_db.delete_wallet(label)
     return True
 
 

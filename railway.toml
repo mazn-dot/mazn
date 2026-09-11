@@ -4,3 +4,8 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "python bot.py"
 restartPolicyType = "ON_FAILURE"
+
+# للحفظ الدائم بدون PostgreSQL:
+# 1) أضف Volume في Railway على المسار /data
+# 2) أو عيّن SQLITE_DB_PATH=/data/trades.db
+# الأفضل: أضف PostgreSQL وربط DATABASE_URL

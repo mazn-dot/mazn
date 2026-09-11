@@ -1,9 +1,9 @@
-# Multi-Chain Wallet Tracker Bot
+# Multi-Chain Wallet Tracker + MEXC Spot Bot
 
-بوت Telegram لمراقبة تحويلات التوكنات على **5 شبكات**:
-BSC · Ethereum · Base · Arbitrum · Polygon
+بوت Telegram لمراقبة تحويلات التوكنات على **BSC + Base**، مع إمكانية شراء تلقائي على MEXC Spot عند ظهور فرص سحب جماعي.
 
 ## العرض النظيف
+
 كل توكن يُعرض بهذا الشكل فقط:
 
 ```
@@ -14,36 +14,61 @@ BSC · Ethereum · Base · Arbitrum · Polygon
 بدون ضجيج — التوكن + السبب فقط.
 
 ## الشبكات
+
 | الشبكة | المصدر |
 |--------|--------|
-| BSC | Public RPC |
-| Ethereum | Public RPC |
-| Base | Public RPC |
-| Arbitrum | Public RPC |
-| Polygon | Public RPC |
+| BSC | Bloxroute + backup |
+| Base | Bloxroute + backup |
 
 السعر والرمز من Dexscreener عند الحاجة.
 
+## الحفظ الدائم (مهم جداً)
+
+الصفقات + الإعدادات + المحافظ كلها محفوظة في قاعدة بيانات واحدة.
+
+| الطريقة | الحالة |
+|---------|--------|
+| **PostgreSQL** (`DATABASE_URL`) | ✅ ثابت — موصى به على Railway |
+| **SQLite على Volume** (`/data/trades.db`) | ✅ ثابت إذا ربطت Volume على `/data` |
+| **SQLite عادي** (بدون Volume) | ⚠️ يضيع عند إعادة تشغيل الخدمة |
+
+### على Railway
+
+1. أضف خدمة **PostgreSQL** واربط متغير `DATABASE_URL` بالبوت  
+   **أو**
+2. أضف **Volume** على المسار `/data` (البوت هيستخدم `/data/trades.db` تلقائياً)
+
+بدون أحد الخيارين، كل شيء يضيع لو البوت فصل واتعمل له redeploy.
+
 ## متغيرات البيئة
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+
+- `TELEGRAM_BOT_TOKEN` (مطلوب)
+- `TELEGRAM_CHAT_ID` (موصى به)
+- `MEXC_API_KEY` / `MEXC_API_SECRET` (للتداول)
+- `DATABASE_URL` (PostgreSQL — الأفضل)
+- `SQLITE_DB_PATH` (اختياري — افتراضي `/data/trades.db` لو Volume موجود)
 
 ## التشغيل
+
 ```bash
 python bot.py
 ```
 
-## الأوامر
-| الأمر | الوظيفة |
-|-------|---------|
+## الأوامر / الأزرار
+
+| الأمر / الزر | الوظيفة |
+|--------------|---------|
 | `إضافة اسم 0x...` | إضافة محفظة |
 | `إضافة حوت اسم 0x...` | إضافة حوت |
 | `حذف الاسم` | حذف محفظة |
 | زر 🐋 حيتان توكن | بحث حيتان |
+| زر ⚙️ إعدادات التداول | حجم / وقف / أهداف / شراء تلقائي |
+| زر 📋 صفقاتي | عرض وإغلاق الصفقات |
 
 ## Score
+
 `score = amount × (1 + count^0.6 / 8)`
-يرفع التوكنات ذات التحويلات الكثيفة حتى لو الكمية متوسطة.
 
 ## تنبيه
+
 المصادر العامة مجانية وقد تُقيَّد. البيانات للمراقبة وليست توصية تداول.

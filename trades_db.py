@@ -11,8 +11,21 @@ from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
-DB_SQLITE = os.getenv("SQLITE_DB_PATH", os.path.join(os.path.dirname(__file__), "trades.db"))
-os.makedirs(os.path.dirname(os.path.abspath(DB_SQLITE)), exist_ok=True)
+def _resolve_sqlite_path():
+    """Prefer persistent volume paths so data survives bot restarts on Railway."""
+    explicit = (os.getenv("SQLITE_DB_PATH") or "").strip()
+    if explicit:
+        return explicit
+    # Common persistent mount points on Railway / Docker
+    for candidate in ("/data/trades.db", "/app/data/trades.db"):
+        parent = os.path.dirname(candidate)
+        if os.path.isdir(parent) and os.access(parent, os.W_OK):
+            return candidate
+    return os.path.join(os.path.dirname(__file__), "trades.db")
+
+
+DB_SQLITE = _resolve_sqlite_path()
+os.makedirs(os.path.dirname(os.path.abspath(DB_SQLITE)) or ".", exist_ok=True)
 
 DEFAULT_SETTINGS = {
     "trade_size_usd": 20.0,
@@ -112,7 +125,17 @@ def storage_status_text():
     _get_pg()  # refresh
     if _STATUS["mode"] == "postgres":
         return f"PostgreSQL 🗄️ ثابت\n{_STATUS['reason']}"
-    return f"SQLite ⚠️ مؤقت (يضيع)\nالسبب: {_STATUS['reason']}"
+    # SQLite: warn unless path is on a known persistent volume
+    path = DB_SQLITE
+    persistent = path.startswith("/data/") or path.startswith("/app/data/")
+    if persistent:
+        return f"SQLite 🗄️ على Volume\n{path}"
+    return (
+        f"SQLite ⚠️ مؤقت (يضيع عند إعادة التشغيل)\n"
+        f"المسار: {path}\n"
+        f"السبب: {_STATUS['reason']}\n"
+        f"👉 أضف PostgreSQL أو Volume على /data"
+    )
 
 
 def use_postgres():
@@ -228,6 +251,12 @@ def init():
                 value TEXT NOT NULL
             )
             """)
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                label TEXT PRIMARY KEY,
+                address TEXT NOT NULL
+            )
+            """)
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute(
                     "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
@@ -251,27 +280,61 @@ def init():
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             )
             """)
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                label TEXT PRIMARY KEY,
+                address TEXT NOT NULL
+            )
+            """)
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (k, json.dumps(v)),
                 )
         _ensure_trade_columns(kind, c)
+        _seed_default_wallets(kind, c)
     # تشخيص: أسماء متغيرات DB الموجودة
     db_keys = [k for k in os.environ if "DATABASE" in k.upper() or "POSTGRES" in k.upper() or "PG" == k[:2].upper()]
     log.info("DB env keys present: %s", db_keys)
     log.info("DB init mode=%s reason=%s", _STATUS["mode"], _STATUS["reason"])
 
 
-# For backward compat
-@property
-def USE_PG():
-    return use_postgres()
-
-
-# monkey for modules that check trades_db.USE_PG as attribute
-class _Mod:
-    pass
+def _seed_default_wallets(kind, c):
+    """Insert default wallets only when the wallets table is empty."""
+    c.execute("SELECT COUNT(*) AS n FROM wallets")
+    row = c.fetchone()
+    count = row["n"] if hasattr(row, "keys") else row[0]
+    if count and int(count) > 0:
+        return
+    try:
+        from config import DEFAULT_WALLETS
+    except Exception:
+        DEFAULT_WALLETS = {}
+    # Migrate legacy wallets.json if present
+    legacy = {}
+    try:
+        legacy_path = os.path.join(os.path.dirname(__file__), "wallets.json")
+        if os.path.isfile(legacy_path):
+            with open(legacy_path, encoding="utf-8") as f:
+                legacy = json.load(f) or {}
+    except Exception:
+        legacy = {}
+    source = legacy if legacy else DEFAULT_WALLETS
+    for label, address in (source or {}).items():
+        if not label or not address:
+            continue
+        if kind == "pg":
+            c.execute(
+                "INSERT INTO wallets (label, address) VALUES (%s, %s) ON CONFLICT (label) DO NOTHING",
+                (str(label), str(address)),
+            )
+        else:
+            c.execute(
+                "INSERT OR IGNORE INTO wallets (label, address) VALUES (?, ?)",
+                (str(label), str(address)),
+            )
+    if source:
+        log.info("Seeded %s wallets into DB", len(source))
 
 
 def get_setting(key, default=None):
@@ -478,9 +541,72 @@ def report_text(limit=40):
 
 
 
+# ---------- Wallets (persisted in same DB as trades/settings) ----------
+
+def load_wallets():
+    """Return {label: address} dict from the wallets table."""
+    init()
+    with db() as (kind, c):
+        c.execute("SELECT label, address FROM wallets ORDER BY label")
+        rows = c.fetchall()
+        out = {}
+        for r in rows:
+            label = r["label"] if hasattr(r, "keys") else r[0]
+            address = r["address"] if hasattr(r, "keys") else r[1]
+            if label and address:
+                out[str(label)] = str(address)
+        return out
+
+
+def save_wallets(data: dict):
+    """Replace all wallets with the given dict (atomic enough for our use)."""
+    init()
+    with db() as (kind, c):
+        c.execute("DELETE FROM wallets")
+        for label, address in (data or {}).items():
+            if not label or not address:
+                continue
+            if kind == "pg":
+                c.execute(
+                    "INSERT INTO wallets (label, address) VALUES (%s, %s) ON CONFLICT (label) DO UPDATE SET address=EXCLUDED.address",
+                    (str(label), str(address)),
+                )
+            else:
+                c.execute(
+                    "INSERT OR REPLACE INTO wallets (label, address) VALUES (?, ?)",
+                    (str(label), str(address)),
+                )
+    return load_wallets()
+
+
+def upsert_wallet(label, address):
+    init()
+    with db() as (kind, c):
+        if kind == "pg":
+            c.execute(
+                "INSERT INTO wallets (label, address) VALUES (%s, %s) ON CONFLICT (label) DO UPDATE SET address=EXCLUDED.address",
+                (str(label), str(address)),
+            )
+        else:
+            c.execute(
+                "INSERT OR REPLACE INTO wallets (label, address) VALUES (?, ?)",
+                (str(label), str(address)),
+            )
+
+
+def delete_wallet(label):
+    init()
+    with db() as (kind, c):
+        ph = "%s" if kind == "pg" else "?"
+        c.execute(f"DELETE FROM wallets WHERE label={ph}", (str(label),))
+        return c.rowcount if hasattr(c, "rowcount") else True
+
+
+# Backward-compatible flag refreshed after init / reconnect attempts.
+USE_PG = False
+
+
 def refresh_use_pg():
     global USE_PG
     USE_PG = use_postgres()
     return USE_PG
-
-USE_PG = False
