@@ -1,5 +1,5 @@
 """
-تنفيذ الشراء التلقائي عند فرصة سحب جماعي
+تنفيذ الشراء التلقائي عند فرصة
 """
 import logging
 import settings
@@ -9,7 +9,7 @@ import mexc_trade
 log = logging.getLogger(__name__)
 
 
-def try_auto_buy(symbol, contract="", chain="", note="سحب جماعي"):
+def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
     """
     يحاول يشتري لو الشروط متحققة.
     يرجع (ok: bool, message: str)
@@ -20,9 +20,7 @@ def try_auto_buy(symbol, contract="", chain="", note="سحب جماعي"):
     if not s.get("monitoring_enabled"):
         return False, "الرصد متوقف"
 
-    if trades_db.count_open() >= s["max_open_trades"]:
-        return False, f"وصلت لأقصى صفقات مفتوحة ({s['max_open_trades']})"
-
+    # مفيش حد أقصى — البوت يتعامل فقط مع صفقاته في قاعدة البيانات
     # لو في صفقة مفتوحة على نفس العملة — نشتري برضو حسب طلبك
     # (مش هنمنع)
 
