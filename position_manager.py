@@ -73,7 +73,9 @@ def _is_bad_order(result):
 
 
 async def emergency_close(app, t, reason, price=None):
-    """خروج طارئ: بيع فوري + تقرير + قفل الصفقة"""
+    """خروج طارئ: بيع فوري + تقرير + قفل الصفقة.
+    لو الرصيد الفعلي صفر (أو dust) حتى لو فشل الأمر → نقفل الصفقة في الداتابيز فوراً.
+    """
     trade_id = t["id"]
     symbol = t["symbol"]
     entry = float(t["entry_price"] or 0)
@@ -85,6 +87,7 @@ async def emergency_close(app, t, reason, price=None):
 
     sell_result = None
     sell_ok = False
+    real_bal = 0.0
     try:
         real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
         qty = real_bal if real_bal > 0 else float(t.get("quantity") or 0)
@@ -92,6 +95,9 @@ async def emergency_close(app, t, reason, price=None):
             sell_result = await _exchange_call(mexc_trade.market_sell, pair, qty)
             bad, _ = _is_bad_order(sell_result)
             sell_ok = not bad
+            # بعد محاولة البيع نعيد قراءة الرصيد للتأكد
+            if not sell_ok:
+                real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
         else:
             sell_result = {"info": "no balance to sell"}
             sell_ok = True  # مفيش رصيد = اعتبرها اتقفلت
@@ -99,6 +105,19 @@ async def emergency_close(app, t, reason, price=None):
         sell_result = {"error": str(e)}
         sell_ok = False
         log.exception("emergency sell failed for %s", symbol)
+        try:
+            real_bal = await _exchange_call(mexc_trade.get_base_balance, pair)
+        except Exception:
+            real_bal = -1
+
+    # لو الرصيد الفعلي شبه صفر → نعتبر الصفقة مقفلة حتى لو الأمر فشل (Oversold / scale / dust)
+    DUST_THRESHOLD = 1e-8
+    if not sell_ok and real_bal is not None and real_bal <= DUST_THRESHOLD:
+        sell_ok = True
+        sell_result = sell_result or {}
+        if isinstance(sell_result, dict):
+            sell_result["forced_close"] = f"balance={real_bal} <= dust → closed in DB"
+        log.info("Force-closing #%s %s because live balance is dust/zero (%.10f)", trade_id, symbol, real_bal)
 
     pnl_p = _pnl_pct(entry, price) if price and entry else 0
     pnl_u = _pnl_usd(entry, price, size, 1.0) if price and entry else 0
@@ -109,12 +128,13 @@ async def emergency_close(app, t, reason, price=None):
             price or entry,
             note=f"EMERGENCY: {reason}",
         )
+        log.info("Trade #%s %s closed in DB (emergency)", trade_id, symbol)
     else:
-        log.error("Keeping trade #%s open because emergency sell failed", trade_id)
+        log.error("Keeping trade #%s open because emergency sell failed (balance=%.8f)", trade_id, real_bal)
     _no_price_count.pop(trade_id, None)
     _sell_fail_count.pop(trade_id, None)
 
-    status = "تم البيع" if sell_ok else "فشل البيع — راجع المنصة يدوي"
+    status = "تم البيع / اتقفلت" if sell_ok else "فشل البيع — راجع المنصة يدوي"
     msg = (
         f"🚨 <b>خروج طارئ</b>\n"
         f"<b>{symbol}</b>\n"
@@ -124,7 +144,7 @@ async def emergency_close(app, t, reason, price=None):
         f"<code>{sell_result}</code>"
     )
     await _notify(app, msg)
-    log.warning("EMERGENCY close #%s %s reason=%s", trade_id, symbol, reason)
+    log.warning("EMERGENCY close #%s %s reason=%s sell_ok=%s", trade_id, symbol, reason, sell_ok)
     return sell_ok
 
 
@@ -185,6 +205,16 @@ async def _check_one(app, t):
         bad, why = _is_bad_order(result)
         if bad:
             _sell_fail_count[trade_id] = _sell_fail_count.get(trade_id, 0) + 1
+            try:
+                bal_after = await _exchange_call(mexc_trade.get_base_balance, pair)
+            except Exception:
+                bal_after = -1
+            if bal_after is not None and bal_after <= 1e-8:
+                log.info("SL sell failed but balance dust → force close #%s", trade_id)
+                trades_db.close_trade(trade_id, price, note=f"StopLoss forced (balance dust): {why}")
+                _sell_fail_count.pop(trade_id, None)
+                await _notify(app, f"تم إغلاق <b>{symbol}</b> (وقف خسارة + رصيد صفر)\n{why}")
+                return
             if _sell_fail_count[trade_id] >= SELL_FAIL_LIMIT:
                 await emergency_close(app, t, f"فشل بيع وقف الخسارة: {why}", price=price)
             return
@@ -244,6 +274,21 @@ async def _check_one(app, t):
         bad, why = _is_bad_order(result)
         if bad:
             _sell_fail_count[trade_id] = _sell_fail_count.get(trade_id, 0) + 1
+            # بعد الفشل نتحقق من الرصيد الفعلي: لو صفر → نقفل فوراً
+            try:
+                bal_after = await _exchange_call(mexc_trade.get_base_balance, pair)
+            except Exception:
+                bal_after = -1
+            if bal_after is not None and bal_after <= 1e-8:
+                log.info("TP%s sell failed but balance is dust → force close #%s", level, trade_id)
+                trades_db.close_trade(trade_id, price, note=f"TP{level} forced (balance dust after sell fail)")
+                _sell_fail_count.pop(trade_id, None)
+                await _notify(
+                    app,
+                    f"تم إغلاق <b>{symbol}</b> تلقائياً بعد فشل البيع (رصيد صفر)\n"
+                    f"الهدف {level} | السبب: {why}",
+                )
+                return
             if _sell_fail_count[trade_id] >= SELL_FAIL_LIMIT:
                 await emergency_close(app, t, f"فشل بيع الهدف {level}: {why}", price=price)
             return
@@ -279,7 +324,12 @@ async def _check_one(app, t):
             await _notify(app, f"✅ <b>{symbol}</b> اتقفلت — كل الأهداف تحققت")
         else:
             # Keep remaining size in DB so restarts / next checks stay correct.
-            remaining = max(0.0, (real_bal if real_bal > 0 else qty) - sell_qty)
+            # Prefer live balance after successful partial sell.
+            try:
+                bal_after = await _exchange_call(mexc_trade.get_base_balance, pair)
+                remaining = max(0.0, bal_after)
+            except Exception:
+                remaining = max(0.0, (real_bal if real_bal > 0 else qty) - sell_qty)
             _update_quantity(trade_id, remaining)
             qty = remaining
 

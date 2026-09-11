@@ -8,9 +8,12 @@ import os
 import time
 import logging
 import math
+from decimal import Decimal, ROUND_DOWN, getcontext
 from urllib.parse import urlencode
 
 import requests
+
+getcontext().prec = 28
 
 log = logging.getLogger(__name__)
 
@@ -105,16 +108,26 @@ def _load_symbol_info(symbol: str):
 
 
 def _round_step(qty: float, step: float) -> float:
-    """Round quantity down to valid step size."""
+    """Round quantity down to valid step size using Decimal for accuracy."""
     if step <= 0:
-        return round(qty, 6)
-    precision = max(0, int(round(-math.log10(step)))) if step < 1 else 0
-    # floor to step
-    rounded = math.floor(qty / step) * step
-    return float(f"{rounded:.{precision}f}")
+        return float(Decimal(str(qty)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
+    d_qty = Decimal(str(qty))
+    d_step = Decimal(str(step))
+    # floor to nearest step
+    rounded = (d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+    # determine display precision from step
+    step_str = f"{step:.10f}".rstrip("0")
+    if "." in step_str:
+        precision = len(step_str.split(".")[1])
+    else:
+        precision = 0
+    return float(rounded.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN))
 
 
 def adjust_quantity(symbol: str, quantity: float) -> float:
+    """Normalize quantity to exchange LOT_SIZE rules. Returns 0 if below minQty."""
+    if quantity <= 0:
+        return 0.0
     info = _load_symbol_info(symbol)
     step = info.get("stepSize") or 0.000001
     min_qty = info.get("minQty") or 0
@@ -165,35 +178,65 @@ def market_buy(symbol: str, quote_usd: float):
     return result
 
 
+def _fmt_qty(qty: float, max_decimals: int = 8) -> str:
+    """Format quantity string without scientific notation and trailing zeros."""
+    s = f"{qty:.{max_decimals}f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
 def market_sell(symbol: str, quantity: float):
+    """
+    Market sell with robust quantity normalization.
+    Tries exchange stepSize first, then progressively coarser precision on scale errors.
+    On Oversold, re-fetches real free balance and retries once with the live amount.
+    """
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
         symbol = symbol + "USDT"
 
-    qty = adjust_quantity(symbol, float(quantity))
+    original = float(quantity)
+    qty = adjust_quantity(symbol, original)
     if qty <= 0:
-        return {"error": "quantity too small after rounding", "original": quantity}
+        return {"error": "quantity too small after rounding", "original": original}
 
-    # format without scientific notation
-    qty_str = f"{qty:.8f}".rstrip("0").rstrip(".")
-    params = {
-        "symbol": symbol,
-        "side": "SELL",
-        "type": "MARKET",
-        "quantity": qty_str,
-    }
-    result = _request("POST", "/api/v3/order", params, signed=True)
+    def _try_sell(q: float):
+        q = adjust_quantity(symbol, q)
+        if q <= 0:
+            return {"error": "quantity too small after rounding", "original": q}
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": _fmt_qty(q),
+        }
+        return _request("POST", "/api/v3/order", params, signed=True)
 
-    # لو فشل بسبب scale، نحاول تقريب أخشن
-    if isinstance(result, dict) and result.get("code") == 400 and "scale" in str(result.get("msg", "")).lower():
-        for decimals in (4, 3, 2, 1, 0):
-            qty2 = math.floor(quantity * (10 ** decimals)) / (10 ** decimals)
+    result = _try_sell(qty)
+
+    # Handle quantity scale / precision errors by trying coarser decimals
+    msg = str(result.get("msg", "")).lower() if isinstance(result, dict) else ""
+    if isinstance(result, dict) and result.get("code") == 400 and ("scale" in msg or "precision" in msg or "lot" in msg):
+        for decimals in (6, 5, 4, 3, 2, 1, 0):
+            factor = 10 ** decimals
+            qty2 = math.floor(original * factor) / factor
             if qty2 <= 0:
                 continue
-            params["quantity"] = f"{qty2:.{decimals}f}"
-            result = _request("POST", "/api/v3/order", params, signed=True)
-            if not (isinstance(result, dict) and result.get("code") == 400):
+            result = _try_sell(qty2)
+            msg2 = str(result.get("msg", "")).lower() if isinstance(result, dict) else ""
+            if not (isinstance(result, dict) and result.get("code") == 400 and ("scale" in msg2 or "precision" in msg2)):
                 break
+
+    # Handle Oversold: re-read free balance and sell whatever is actually free
+    if isinstance(result, dict) and (result.get("code") == 30005 or "oversold" in str(result.get("msg", "")).lower()):
+        live = get_base_balance(symbol)
+        if live > 0:
+            # leave a tiny dust buffer to avoid residual oversold
+            safe = live * 0.999
+            result = _try_sell(safe)
+            if isinstance(result, dict) and (result.get("code") == 30005 or "oversold" in str(result.get("msg", "")).lower()):
+                # last resort: even smaller
+                result = _try_sell(live * 0.995)
+
     return result
 
 
