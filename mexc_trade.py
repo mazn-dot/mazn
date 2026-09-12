@@ -182,6 +182,12 @@ def market_buy(symbol: str, quote_usd: float):
     if quote_usd < 1:
         return {"error": "amount too small", "min": 1}
 
+    change_24h = get_24h_change_percent(symbol)
+    if change_24h is None:
+        return {"error": f"تم إلغاء الشراء: تعذر التحقق من تغير {symbol} خلال 24 ساعة"}
+    if change_24h > 5.0:
+        return {"error": f"تم إلغاء الشراء: {symbol} مرتفع {change_24h:+.2f}% خلال 24 ساعة (الحد +5%)"}
+
     info = _load_symbol_info(symbol)
     if not info.get("supported"):
         return {"error": f"زوج {symbol} غير مدعوم على MEXC Spot API"}
