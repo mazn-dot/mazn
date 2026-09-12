@@ -38,6 +38,12 @@ def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
     if change_24h is not None and change_24h > 5.0:
         return False, f"تخطي الشراء: {pair} مرتفع {change_24h:+.2f}% خلال 24 ساعة (الحد +5%)"
 
+    dex_change = mexc_trade.get_dex_24h_change_percent(contract, chain)
+    if dex_change is None:
+        return False, "تخطي الشراء: تعذر التحقق من ارتفاع العملة على الشبكة خلال 24 ساعة"
+    if dex_change > 5.0:
+        return False, f"تخطي الشراء: {symbol.upper()} مرتفع {dex_change:+.2f}% على الشبكة خلال 24 ساعة (الحد +5%)"
+
     size = float(s["trade_size_usd"])
     balance = mexc_trade.get_balance("USDT")
     if balance < size:

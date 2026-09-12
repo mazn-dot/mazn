@@ -89,6 +89,29 @@ def get_24h_change_percent(symbol: str):
     return None
 
 
+def get_dex_24h_change_percent(contract: str, chain: str):
+    """Return Dexscreener h24 change for the opportunity's on-chain token."""
+    if not contract or not str(contract).startswith("0x"):
+        return None
+    chain_id = {"ethereum": "ethereum", "bsc": "bsc", "base": "base"}.get(str(chain).lower(), str(chain).lower())
+    try:
+        response = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=10
+        )
+        pairs = response.json().get("pairs") or []
+        matching = [p for p in pairs if str(p.get("chainId", "")).lower() == chain_id]
+        if not matching:
+            matching = pairs
+        changes = []
+        for pair in matching:
+            value = (pair.get("priceChange") or {}).get("h24")
+            if value is not None:
+                changes.append(float(value))
+        return max(changes) if changes else None
+    except (requests.RequestException, AttributeError, TypeError, ValueError):
+        return None
+
+
 def get_balance(asset: str = "USDT") -> float:
     data = _request("GET", "/api/v3/account", signed=True)
     if "balances" not in data:
