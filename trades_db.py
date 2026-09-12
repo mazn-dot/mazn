@@ -424,6 +424,7 @@ def count_open():
 
 
 def close_trade(trade_id, close_price, note=""):
+    """Finalize a successfully sold trade and remove it from active storage."""
     init()
     with db() as (kind, c):
         ph = "%s" if kind == "pg" else "?"
@@ -434,20 +435,18 @@ def close_trade(trade_id, close_price, note=""):
         row = dict(row)
         entry = row["entry_price"]
         pnl = ((close_price - entry) / entry) * 100 if entry else 0
-        old_note = row.get("note") or ""
-        if kind == "pg":
-            c.execute(
-                """UPDATE trades SET status='closed', closed_at=%s, close_price=%s,
-                   pnl_pct=%s, note=%s WHERE id=%s""",
-                (_timestamp_value(kind, c, "closed_at"), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
-            )
-        else:
-            c.execute(
-                """UPDATE trades SET status='closed', closed_at=?, close_price=?,
-                   pnl_pct=?, note=? WHERE id=?""",
-                (_timestamp_value(kind, c, "closed_at"), close_price, pnl, (old_note + " | " + note).strip(" |"), trade_id),
-            )
+        ph = "%s" if kind == "pg" else "?"
+        c.execute(f"DELETE FROM trades WHERE id={ph}", (trade_id,))
         return pnl
+
+
+def delete_trade(trade_id):
+    """Delete an open trade that is confirmed absent from the exchange balance."""
+    init()
+    with db() as (kind, c):
+        ph = "%s" if kind == "pg" else "?"
+        c.execute(f"DELETE FROM trades WHERE id={ph} AND status='open'", (trade_id,))
+        return c.rowcount if hasattr(c, "rowcount") else 0
 
 
 def mark_tp(trade_id, level):

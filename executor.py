@@ -25,10 +25,18 @@ def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
     if open_count >= max_open:
         return False, f"وصلت لحد الصفقات المفتوحة ({open_count}/{max_open})"
 
+    normalized_symbol = str(symbol or "").upper().strip()
+    if trades_db.has_open_symbol(normalized_symbol):
+        return False, f"تخطي الشراء: صفقة {normalized_symbol} مفتوحة بالفعل"
+
     pair = mexc_trade.resolve_symbol(symbol)
     price = mexc_trade.get_price(pair)
     if price <= 0:
         return False, f"مفيش سعر لـ {pair} على MEXC (قد تكون مش مدرجة)"
+
+    change_24h = mexc_trade.get_24h_change_percent(pair)
+    if change_24h is not None and change_24h > 5.0:
+        return False, f"تخطي الشراء: {pair} مرتفع {change_24h:+.2f}% خلال 24 ساعة (الحد +5%)"
 
     size = float(s["trade_size_usd"])
     balance = mexc_trade.get_balance("USDT")
@@ -51,7 +59,11 @@ def try_auto_buy(symbol, contract="", chain="", note="فرصة"):
     if not isinstance(order, dict):
         return False, f"فشل أمر الشراء: {order}"
     if order.get("error"):
+        if "غير مدعوم" in str(order.get("error")):
+            return False, f"⚠️ التنبيه وصل، لكن {pair} غير مدعوم للتداول على MEXC Spot"
         return False, f"فشل أمر الشراء: {order}"
+    if str(order.get("code", "")) == "10007" or "symbol not support" in str(order.get("msg", "")).lower():
+        return False, f"⚠️ التنبيه وصل، لكن {pair} غير مدعوم للتداول على MEXC Spot"
     if order.get("code") and int(order.get("code", 0)) not in (0, 200):
         return False, f"فشل أمر الشراء: {order}"
 

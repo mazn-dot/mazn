@@ -70,6 +70,25 @@ def get_price(symbol: str) -> float:
         return 0.0
 
 
+def get_24h_change_percent(symbol: str):
+    """Return MEXC spot percentage change over the last 24 hours, or None."""
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+    data = _request("GET", "/api/v3/ticker/24hr", {"symbol": symbol})
+    try:
+        value = data.get("priceChangePercent")
+        if value is not None:
+            return float(value)
+        open_price = float(data.get("openPrice") or 0)
+        last_price = float(data.get("lastPrice") or 0)
+        if open_price > 0 and last_price > 0:
+            return ((last_price - open_price) / open_price) * 100.0
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
 def get_balance(asset: str = "USDT") -> float:
     data = _request("GET", "/api/v3/account", signed=True)
     if "balances" not in data:
@@ -80,19 +99,36 @@ def get_balance(asset: str = "USDT") -> float:
     return 0.0
 
 
+def get_balance_checked(asset: str = "USDT"):
+    """Return balance, or None when the exchange account could not be read."""
+    data = _request("GET", "/api/v3/account", signed=True)
+    if not isinstance(data, dict) or "balances" not in data:
+        return None
+    for b in data["balances"]:
+        if b.get("asset", "").upper() == asset.upper():
+            try:
+                return float(b.get("free", 0))
+            except (TypeError, ValueError):
+                return None
+    return 0.0
+
+
 def _load_symbol_info(symbol: str):
     """Fetch lot size / step size for the symbol."""
     symbol = symbol.upper()
     if symbol in _symbol_info:
         return _symbol_info[symbol]
     data = _request("GET", "/api/v3/exchangeInfo", {"symbol": symbol})
-    info = {"stepSize": 0.000001, "minQty": 0.0, "tickSize": 0.000001, "baseAsset": ""}
+    info = {"supported": False, "stepSize": 0.000001, "minQty": 0.0, "tickSize": 0.000001, "baseAsset": ""}
     try:
         symbols = data.get("symbols") or []
         if not symbols and data.get("symbol"):
             symbols = [data]
         for s in symbols:
             if s.get("symbol", "").upper() == symbol:
+                status_ok = str(s.get("status", "")).upper() in ("", "1", "ENABLED", "TRADING")
+                spot_ok = s.get("isSpotTradingAllowed", True) is not False
+                info["supported"] = status_ok and spot_ok and "MARKET" in (s.get("orderTypes") or [])
                 info["baseAsset"] = s.get("baseAsset", "")
                 for f in s.get("filters", []):
                     if f.get("filterType") == "LOT_SIZE":
@@ -146,12 +182,15 @@ def market_buy(symbol: str, quote_usd: float):
     if quote_usd < 1:
         return {"error": "amount too small", "min": 1}
 
-    # تحقق إن الزوج موجود وله سعر
+    info = _load_symbol_info(symbol)
+    if not info.get("supported"):
+        return {"error": f"زوج {symbol} غير مدعوم على MEXC Spot API"}
+
+    # تحقق إن للزوج سعرًا
     price = get_price(symbol)
     if price <= 0:
         return {"error": f"no price for {symbol} — may be delisted or not on MEXC spot"}
 
-    info = _load_symbol_info(symbol)
     # بعض الأزواج بتحتاج quantity بدل quoteOrderQty
     params = {
         "symbol": symbol,
