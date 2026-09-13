@@ -24,12 +24,20 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any, Tuple
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 import ccxt
 from dotenv import load_dotenv
+
+# Optional Postgres support (Railway DATABASE_URL)
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 load_dotenv()
 
@@ -65,68 +73,151 @@ logging.basicConfig(
 logger = logging.getLogger("MEXC-SPOT-V2")
 
 # ==================== DATABASE ====================
+# Supports both SQLite (default) and Postgres (if DATABASE_URL is set on Railway)
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL and HAS_PSYCOPG2)
+
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Return a DB connection. Postgres if DATABASE_URL exists, else SQLite."""
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        return conn
+    else:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def _execute(conn, sql, params=None):
+    """Helper that works for both SQLite and Postgres (converts ? to %s)."""
+    if USE_POSTGRES:
+        sql = sql.replace("?", "%s")
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    else:
+        cur = conn.cursor()
+    if params:
+        cur.execute(sql, params)
+    else:
+        cur.execute(sql)
+    return cur
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            enabled INTEGER DEFAULT 1,
-            last_msg_id INTEGER DEFAULT 0,
-            added_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            qty REAL,
-            remaining_qty REAL,
-            entry_price REAL,
-            stop_loss REAL,
-            current_sl REAL,
-            tp1 REAL, tp2 REAL, tp3 REAL,
-            tp1_hit INTEGER DEFAULT 0,
-            tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            order_id TEXT,
-            signal_raw TEXT,
-            opened_at TEXT,
-            paper INTEGER DEFAULT 1,
-            status TEXT DEFAULT 'open'
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trades_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            qty REAL,
-            price REAL,
-            pnl REAL,
-            reason TEXT,
-            paper INTEGER,
-            closed_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS processed (
-            msg_key TEXT PRIMARY KEY,
-            processed_at TEXT
-        )
-    """)
+    cur = conn.cursor() if not USE_POSTGRES else conn.cursor()
+
+    if USE_POSTGRES:
+        # Postgres schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                last_msg_id BIGINT DEFAULT 0,
+                added_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                id SERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                qty DOUBLE PRECISION,
+                remaining_qty DOUBLE PRECISION,
+                entry_price DOUBLE PRECISION,
+                stop_loss DOUBLE PRECISION,
+                current_sl DOUBLE PRECISION,
+                tp1 DOUBLE PRECISION, tp2 DOUBLE PRECISION, tp3 DOUBLE PRECISION,
+                tp1_hit INTEGER DEFAULT 0,
+                tp2_hit INTEGER DEFAULT 0,
+                tp3_hit INTEGER DEFAULT 0,
+                order_id TEXT,
+                signal_raw TEXT,
+                opened_at TEXT,
+                paper INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'open'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades_history (
+                id SERIAL PRIMARY KEY,
+                symbol TEXT,
+                side TEXT,
+                qty DOUBLE PRECISION,
+                price DOUBLE PRECISION,
+                pnl DOUBLE PRECISION,
+                reason TEXT,
+                paper INTEGER,
+                closed_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed (
+                msg_key TEXT PRIMARY KEY,
+                processed_at TEXT
+            )
+        """)
+    else:
+        # SQLite schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                last_msg_id INTEGER DEFAULT 0,
+                added_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                qty REAL,
+                remaining_qty REAL,
+                entry_price REAL,
+                stop_loss REAL,
+                current_sl REAL,
+                tp1 REAL, tp2 REAL, tp3 REAL,
+                tp1_hit INTEGER DEFAULT 0,
+                tp2_hit INTEGER DEFAULT 0,
+                tp3_hit INTEGER DEFAULT 0,
+                order_id TEXT,
+                signal_raw TEXT,
+                opened_at TEXT,
+                paper INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'open'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                side TEXT,
+                qty REAL,
+                price REAL,
+                pnl REAL,
+                reason TEXT,
+                paper INTEGER,
+                closed_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed (
+                msg_key TEXT PRIMARY KEY,
+                processed_at TEXT
+            )
+        """)
+
     # defaults
     defaults = {
         "trade_amount": str(DEFAULT_TRADE_AMOUNT),
@@ -138,27 +229,59 @@ def init_db():
         "tp3_pct": str(DEFAULT_TP_PCTS[2]),
     }
     for k, v in defaults.items():
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+                (k, v)
+            )
+        else:
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+
     # default channel
-    c.execute(
-        "INSERT OR IGNORE INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
-        ("abojasimp", datetime.now(timezone.utc).isoformat())
-    )
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (%s, 1, 0, %s) ON CONFLICT (username) DO NOTHING",
+            ("abojasimp", datetime.now(timezone.utc).isoformat())
+        )
+    else:
+        cur.execute(
+            "INSERT OR IGNORE INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
+            ("abojasimp", datetime.now(timezone.utc).isoformat())
+        )
+
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
+    db_type = "PostgreSQL (Railway)" if USE_POSTGRES else "SQLite"
+    logger.info(f"Database initialized → {db_type}")
 
 def db_get(key: str, default: str = "") -> str:
     conn = get_db()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else default
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else default
+        else:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+    finally:
+        conn.close()
 
 def db_set(key: str, value: str):
     conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, str(value))
+            )
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_settings() -> Dict:
     return {
@@ -305,8 +428,15 @@ def tp_keyboard(which: str) -> dict:
 
 def channels_keyboard() -> dict:
     conn = get_db()
-    rows = conn.execute("SELECT username, enabled FROM channels ORDER BY id").fetchall()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT username, enabled FROM channels ORDER BY id")
+            rows = cur.fetchall()
+        else:
+            rows = conn.execute("SELECT username, enabled FROM channels ORDER BY id").fetchall()
+    finally:
+        conn.close()
     buttons = []
     for r in rows:
         status = "✅" if r["enabled"] else "❌"
@@ -598,9 +728,16 @@ def execute_spot_sell(symbol: str, amount: float, reason: str, paper: bool) -> O
 # ==================== POSITIONS & TRAILING ====================
 def count_open_positions() -> int:
     conn = get_db()
-    n = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='open'").fetchone()["c"]
-    conn.close()
-    return n
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT COUNT(*) as c FROM positions WHERE status='open'")
+            n = cur.fetchone()["c"]
+        else:
+            n = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='open'").fetchone()["c"]
+        return n
+    finally:
+        conn.close()
 
 def open_position(sig: Dict, order: Dict, settings: Dict):
     symbol = sig["symbol"]
@@ -609,41 +746,56 @@ def open_position(sig: Dict, order: Dict, settings: Dict):
     if price <= 0:
         price = 1.0
 
-    # Calculate 3 TPs from percentages
     tp1 = price * (1 + settings["tp1_pct"] / 100)
     tp2 = price * (1 + settings["tp2_pct"] / 100)
     tp3 = price * (1 + settings["tp3_pct"] / 100)
 
-    # If signal has a target, use it as TP1 (override)
     if sig.get("target") and sig["target"] > price:
         tp1 = float(sig["target"])
-        # keep relative spacing or leave tp2/tp3 as %
 
-    # Initial SL from signal (mandatory preference)
     sl = float(sig["stop"]) if sig.get("stop") and sig["stop"] > 0 else price * 0.95
 
     conn = get_db()
-    conn.execute("""
-        INSERT INTO positions (
-            symbol, qty, remaining_qty, entry_price, stop_loss, current_sl,
-            tp1, tp2, tp3, order_id, signal_raw, opened_at, paper, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-    """, (
-        symbol, qty, qty, price, sl, sl,
-        tp1, tp2, tp3,
-        str(order.get("id")),
-        sig.get("raw", "")[:500],
-        datetime.now(timezone.utc).isoformat(),
-        1 if settings["paper_mode"] else 0,
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        params = (
+            symbol, qty, qty, price, sl, sl,
+            tp1, tp2, tp3,
+            str(order.get("id")),
+            sig.get("raw", "")[:500],
+            datetime.now(timezone.utc).isoformat(),
+            1 if settings["paper_mode"] else 0,
+        )
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO positions (
+                    symbol, qty, remaining_qty, entry_price, stop_loss, current_sl,
+                    tp1, tp2, tp3, order_id, signal_raw, opened_at, paper, status
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
+            """, params)
+        else:
+            conn.execute("""
+                INSERT INTO positions (
+                    symbol, qty, remaining_qty, entry_price, stop_loss, current_sl,
+                    tp1, tp2, tp3, order_id, signal_raw, opened_at, paper, status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+            """, params)
+        conn.commit()
+    finally:
+        conn.close()
 
 def check_and_manage_positions():
     settings = get_settings()
     conn = get_db()
-    rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM positions WHERE status='open'")
+            rows = cur.fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+    finally:
+        conn.close()
 
     for row in rows:
         try:
@@ -711,56 +863,101 @@ def check_and_manage_positions():
 
 def update_position_after_tp(pos_id: int, new_qty: float, new_sl: float, tp1_hit=False, tp2_hit=False):
     conn = get_db()
-    if tp1_hit:
-        conn.execute(
-            "UPDATE positions SET remaining_qty=?, current_sl=?, tp1_hit=1 WHERE id=?",
-            (new_qty, new_sl, pos_id)
-        )
-    if tp2_hit:
-        conn.execute(
-            "UPDATE positions SET remaining_qty=?, current_sl=?, tp2_hit=1 WHERE id=?",
-            (new_qty, new_sl, pos_id)
-        )
-    conn.commit()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            if tp1_hit:
+                cur.execute(
+                    "UPDATE positions SET remaining_qty=%s, current_sl=%s, tp1_hit=1 WHERE id=%s",
+                    (new_qty, new_sl, pos_id)
+                )
+            if tp2_hit:
+                cur.execute(
+                    "UPDATE positions SET remaining_qty=%s, current_sl=%s, tp2_hit=1 WHERE id=%s",
+                    (new_qty, new_sl, pos_id)
+                )
+        else:
+            if tp1_hit:
+                conn.execute(
+                    "UPDATE positions SET remaining_qty=?, current_sl=?, tp1_hit=1 WHERE id=?",
+                    (new_qty, new_sl, pos_id)
+                )
+            if tp2_hit:
+                conn.execute(
+                    "UPDATE positions SET remaining_qty=?, current_sl=?, tp2_hit=1 WHERE id=?",
+                    (new_qty, new_sl, pos_id)
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 def close_position(pos_id: int, qty: float, price: float, reason: str, paper: bool):
     conn = get_db()
-    row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
-    if row:
-        entry = float(row["entry_price"])
-        pnl = (price - entry) * qty
-        conn.execute(
-            "UPDATE positions SET remaining_qty=0, status='closed' WHERE id=?",
-            (pos_id,)
-        )
-        conn.execute("""
-            INSERT INTO trades_history (symbol, side, qty, price, pnl, reason, paper, closed_at)
-            VALUES (?, 'sell', ?, ?, ?, ?, ?, ?)
-        """, (
-            row["symbol"], qty, price, pnl, reason, 1 if paper else 0,
-            datetime.now(timezone.utc).isoformat()
-        ))
-    conn.commit()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM positions WHERE id=%s", (pos_id,))
+            row = cur.fetchone()
+            if row:
+                entry = float(row["entry_price"])
+                pnl = (price - entry) * qty
+                cur.execute("UPDATE positions SET remaining_qty=0, status='closed' WHERE id=%s", (pos_id,))
+                cur.execute("""
+                    INSERT INTO trades_history (symbol, side, qty, price, pnl, reason, paper, closed_at)
+                    VALUES (%s, 'sell', %s, %s, %s, %s, %s, %s)
+                """, (row["symbol"], qty, price, pnl, reason, 1 if paper else 0, datetime.now(timezone.utc).isoformat()))
+        else:
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+            if row:
+                entry = float(row["entry_price"])
+                pnl = (price - entry) * qty
+                conn.execute("UPDATE positions SET remaining_qty=0, status='closed' WHERE id=?", (pos_id,))
+                conn.execute("""
+                    INSERT INTO trades_history (symbol, side, qty, price, pnl, reason, paper, closed_at)
+                    VALUES (?, 'sell', ?, ?, ?, ?, ?, ?)
+                """, (row["symbol"], qty, price, pnl, reason, 1 if paper else 0, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
 
 # ==================== PROCESS SIGNAL ====================
 def already_processed(key: str) -> bool:
     conn = get_db()
-    row = conn.execute("SELECT 1 FROM processed WHERE msg_key=?", (key,)).fetchone()
-    conn.close()
-    return bool(row)
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM processed WHERE msg_key=%s", (key,))
+            row = cur.fetchone()
+        else:
+            row = conn.execute("SELECT 1 FROM processed WHERE msg_key=?", (key,)).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
 
 def mark_processed(key: str):
     conn = get_db()
-    conn.execute(
-        "INSERT OR IGNORE INTO processed (msg_key, processed_at) VALUES (?, ?)",
-        (key, datetime.now(timezone.utc).isoformat())
-    )
-    # keep table small
-    conn.execute("DELETE FROM processed WHERE rowid NOT IN (SELECT rowid FROM processed ORDER BY processed_at DESC LIMIT 500)")
-    conn.commit()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO processed (msg_key, processed_at) VALUES (%s, %s) ON CONFLICT (msg_key) DO NOTHING",
+                (key, datetime.now(timezone.utc).isoformat())
+            )
+            # keep table small
+            cur.execute("""
+                DELETE FROM processed WHERE msg_key NOT IN (
+                    SELECT msg_key FROM processed ORDER BY processed_at DESC LIMIT 500
+                )
+            """)
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO processed (msg_key, processed_at) VALUES (?, ?)",
+                (key, datetime.now(timezone.utc).isoformat())
+            )
+            conn.execute("DELETE FROM processed WHERE rowid NOT IN (SELECT rowid FROM processed ORDER BY processed_at DESC LIMIT 500)")
+        conn.commit()
+    finally:
+        conn.close()
 
 def process_signal(msg: Dict):
     settings = get_settings()
@@ -779,12 +976,21 @@ def process_signal(msg: Dict):
 
     # Update last_msg_id for channel
     conn = get_db()
-    conn.execute(
-        "UPDATE channels SET last_msg_id = MAX(last_msg_id, ?) WHERE username=?",
-        (msg_id, channel)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE channels SET last_msg_id = GREATEST(last_msg_id, %s) WHERE username=%s",
+                (msg_id, channel)
+            )
+        else:
+            conn.execute(
+                "UPDATE channels SET last_msg_id = MAX(last_msg_id, ?) WHERE username=?",
+                (msg_id, channel)
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
     if sig["direction"] != "LONG":
         tg_send(f"ℹ️ إشارة SHORT تم تجاهلها\n{sig['symbol']}\nمن @{channel}")
@@ -914,8 +1120,15 @@ def handle_callback(cq: dict):
 
     elif data == "positions":
         conn = get_db()
-        rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
-        conn.close()
+        try:
+            if USE_POSTGRES:
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("SELECT * FROM positions WHERE status='open'")
+                rows = cur.fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+        finally:
+            conn.close()
         if not rows:
             text = "لا توجد صفقات مفتوحة"
         else:
@@ -945,20 +1158,36 @@ def handle_callback(cq: dict):
     elif data.startswith("ch_toggle_"):
         user = data.replace("ch_toggle_", "")
         conn = get_db()
-        row = conn.execute("SELECT enabled FROM channels WHERE username=?", (user,)).fetchone()
-        if row:
-            new = 0 if row["enabled"] else 1
-            conn.execute("UPDATE channels SET enabled=? WHERE username=?", (new, user))
+        try:
+            if USE_POSTGRES:
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("SELECT enabled FROM channels WHERE username=%s", (user,))
+                row = cur.fetchone()
+                if row:
+                    newv = 0 if row["enabled"] else 1
+                    cur.execute("UPDATE channels SET enabled=%s WHERE username=%s", (newv, user))
+            else:
+                row = conn.execute("SELECT enabled FROM channels WHERE username=?", (user,)).fetchone()
+                if row:
+                    newv = 0 if row["enabled"] else 1
+                    conn.execute("UPDATE channels SET enabled=? WHERE username=?", (newv, user))
             conn.commit()
-        conn.close()
+        finally:
+            conn.close()
         handle_callback({"data": "channels", "id": cq_id, "message": msg})
 
     elif data.startswith("ch_del_"):
         user = data.replace("ch_del_", "")
         conn = get_db()
-        conn.execute("DELETE FROM channels WHERE username=?", (user,))
-        conn.commit()
-        conn.close()
+        try:
+            if USE_POSTGRES:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM channels WHERE username=%s", (user,))
+            else:
+                conn.execute("DELETE FROM channels WHERE username=?", (user,))
+            conn.commit()
+        finally:
+            conn.close()
         tg_send(f"تم حذف @{user}")
         handle_callback({"data": "channels", "id": cq_id, "message": msg})
 
@@ -1001,15 +1230,28 @@ def handle_text_message(text: str, chat_id: str):
             return
         conn = get_db()
         try:
-            conn.execute(
-                "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
-                (username, datetime.now(timezone.utc).isoformat())
-            )
+            if USE_POSTGRES:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (%s, 1, 0, %s) ON CONFLICT (username) DO NOTHING",
+                    (username, datetime.now(timezone.utc).isoformat())
+                )
+                if cur.rowcount == 0:
+                    tg_send("القناة موجودة مسبقًا")
+                else:
+                    tg_send(f"✅ تمت إضافة @{username}")
+            else:
+                try:
+                    conn.execute(
+                        "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
+                        (username, datetime.now(timezone.utc).isoformat())
+                    )
+                    tg_send(f"✅ تمت إضافة @{username}")
+                except sqlite3.IntegrityError:
+                    tg_send("القناة موجودة مسبقًا")
             conn.commit()
-            tg_send(f"✅ تمت إضافة @{username}")
-        except sqlite3.IntegrityError:
-            tg_send("القناة موجودة مسبقًا")
-        conn.close()
+        finally:
+            conn.close()
         del waiting_for[chat_id]
         return
 
@@ -1050,21 +1292,33 @@ def poll_telegram():
 
 def monitor_channels():
     conn = get_db()
-    channels = conn.execute("SELECT username, last_msg_id FROM channels WHERE enabled=1").fetchall()
-    conn.close()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT username, last_msg_id FROM channels WHERE enabled=1")
+            channels = cur.fetchall()
+        else:
+            channels = conn.execute("SELECT username, last_msg_id FROM channels WHERE enabled=1").fetchall()
+    finally:
+        conn.close()
     for ch in channels:
         username = ch["username"]
         last_id = ch["last_msg_id"] or 0
         messages = scrape_channel(username)
         if not messages:
             continue
-        # first run for this channel → skip history
         if last_id == 0:
             max_id = max(m["id"] for m in messages)
             conn = get_db()
-            conn.execute("UPDATE channels SET last_msg_id=? WHERE username=?", (max_id, username))
-            conn.commit()
-            conn.close()
+            try:
+                if USE_POSTGRES:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE channels SET last_msg_id=%s WHERE username=%s", (max_id, username))
+                else:
+                    conn.execute("UPDATE channels SET last_msg_id=? WHERE username=?", (max_id, username))
+                conn.commit()
+            finally:
+                conn.close()
             logger.info(f"@{username} first run → skip history, last_id={max_id}")
             continue
         for msg in messages:
