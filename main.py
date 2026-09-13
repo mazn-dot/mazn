@@ -44,14 +44,13 @@ TELEGRAM_ADMIN_ID = str(os.getenv("TELEGRAM_ADMIN_ID", "")).strip()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
 
-DEFAULT_TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT_USDT", "10"))
-DEFAULT_PAPER = os.getenv("PAPER_MODE", "true").lower() in ("true", "1", "yes")
-DEFAULT_TRADING = os.getenv("TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
-POLL_INTERVAL = max(3, int(os.getenv("POLL_INTERVAL", "5")))
-DEFAULT_MAX_POS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+# === Defaults (managed only from Telegram Bot after first run) ===
+DEFAULT_TRADE_AMOUNT = 10.0
+DEFAULT_PAPER = True
+DEFAULT_TRADING = False
+POLL_INTERVAL = 5
+DEFAULT_MAX_POS = 3
 MAX_TRADE_HARD_LIMIT = 500.0
-
-# Default 3 TPs as percentages from entry (can be changed from bot)
 DEFAULT_TP_PCTS = [5.0, 10.0, 15.0]  # +5% / +10% / +15%
 
 # ==================== LOGGING ====================
