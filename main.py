@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-MEXC SPOT Auto Trader - Single File
-- Reads public Telegram channel via Web Preview only (no API ID/Hash)
-- SPOT BUY only for LONG signals (ignores SHORT + leverage)
-- Control via your Telegram Bot
-- Paper mode default = True
-- Designed for Railway 24/7
+MEXC SPOT Auto Trader v2 - Full Telegram Control
+- Web Preview only (no API ID/Hash)
+- SPOT BUY only for LONG
+- Inline buttons for everything
+- Max open positions limit
+- 3 Take-Profit levels + trailing stop (move SL to entry on TP1)
+- Signal Stop used as initial SL
+- Manage channels from bot
+- SQLite persistence
 """
 
 import os
@@ -16,9 +19,12 @@ import re
 import hashlib
 import logging
 import traceback
+import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any, Tuple
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,22 +33,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==================== CONFIG ====================
-CHANNEL = "abojasimp"
-CHANNEL_URL = f"https://t.me/s/{CHANNEL}"
-STATE_FILE = Path("state.json")
-LOG_FILE = Path("trader.log")
+# ==================== PATHS & CONFIG ====================
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "trader.db"
+LOG_FILE = DATA_DIR / "trader.log"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+TELEGRAM_ADMIN_ID = str(os.getenv("TELEGRAM_ADMIN_ID", "")).strip()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
 
-TRADE_AMOUNT_USDT = float(os.getenv("TRADE_AMOUNT_USDT", "10"))
-PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() in ("true", "1", "yes")
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
+DEFAULT_TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT_USDT", "10"))
+DEFAULT_PAPER = os.getenv("PAPER_MODE", "true").lower() in ("true", "1", "yes")
+DEFAULT_TRADING = os.getenv("TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
 POLL_INTERVAL = max(3, int(os.getenv("POLL_INTERVAL", "5")))
-MAX_TRADE_AMOUNT = 500.0  # safety hard limit
+DEFAULT_MAX_POS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_TRADE_HARD_LIMIT = 500.0
+
+# Default 3 TPs as percentages from entry (can be changed from bot)
+DEFAULT_TP_PCTS = [5.0, 10.0, 15.0]  # +5% / +10% / +15%
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -53,93 +63,269 @@ logging.basicConfig(
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
-logger = logging.getLogger("MEXC-SPOT-TRADER")
+logger = logging.getLogger("MEXC-SPOT-V2")
 
-# ==================== STATE ====================
-class State:
-    def __init__(self):
-        self.last_msg_id: int = 0
-        self.processed_hashes: List[str] = []
-        self.positions: Dict[str, Dict] = {}  # symbol -> position data
-        self.trading_enabled: bool = TRADING_ENABLED
-        self.paper_mode: bool = PAPER_MODE
-        self.trade_amount: float = TRADE_AMOUNT_USDT
-        self.last_signal: Optional[Dict] = None
-        self.load()
+# ==================== DATABASE ====================
+def get_db():
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def load(self):
-        if STATE_FILE.exists():
-            try:
-                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                self.last_msg_id = int(data.get("last_msg_id", 0))
-                self.processed_hashes = data.get("processed_hashes", [])[-200:]
-                self.positions = data.get("positions", {})
-                self.trading_enabled = data.get("trading_enabled", TRADING_ENABLED)
-                self.paper_mode = data.get("paper_mode", PAPER_MODE)
-                self.trade_amount = float(data.get("trade_amount", TRADE_AMOUNT_USDT))
-                self.last_signal = data.get("last_signal")
-                logger.info(f"State loaded | last_msg_id={self.last_msg_id} | positions={len(self.positions)}")
-            except Exception as e:
-                logger.error(f"Failed to load state: {e}")
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            last_msg_id INTEGER DEFAULT 0,
+            added_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            qty REAL,
+            remaining_qty REAL,
+            entry_price REAL,
+            stop_loss REAL,
+            current_sl REAL,
+            tp1 REAL, tp2 REAL, tp3 REAL,
+            tp1_hit INTEGER DEFAULT 0,
+            tp2_hit INTEGER DEFAULT 0,
+            tp3_hit INTEGER DEFAULT 0,
+            order_id TEXT,
+            signal_raw TEXT,
+            opened_at TEXT,
+            paper INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'open'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trades_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            side TEXT,
+            qty REAL,
+            price REAL,
+            pnl REAL,
+            reason TEXT,
+            paper INTEGER,
+            closed_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS processed (
+            msg_key TEXT PRIMARY KEY,
+            processed_at TEXT
+        )
+    """)
+    # defaults
+    defaults = {
+        "trade_amount": str(DEFAULT_TRADE_AMOUNT),
+        "paper_mode": "1" if DEFAULT_PAPER else "0",
+        "trading_enabled": "1" if DEFAULT_TRADING else "0",
+        "max_positions": str(DEFAULT_MAX_POS),
+        "tp1_pct": str(DEFAULT_TP_PCTS[0]),
+        "tp2_pct": str(DEFAULT_TP_PCTS[1]),
+        "tp3_pct": str(DEFAULT_TP_PCTS[2]),
+    }
+    for k, v in defaults.items():
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+    # default channel
+    c.execute(
+        "INSERT OR IGNORE INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
+        ("abojasimp", datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
 
-    def save(self):
-        try:
-            data = {
-                "last_msg_id": self.last_msg_id,
-                "processed_hashes": self.processed_hashes[-200:],
-                "positions": self.positions,
-                "trading_enabled": self.trading_enabled,
-                "paper_mode": self.paper_mode,
-                "trade_amount": self.trade_amount,
-                "last_signal": self.last_signal,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+def db_get(key: str, default: str = "") -> str:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
 
-state = State()
+def db_set(key: str, value: str):
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
 
-# ==================== TELEGRAM BOT HELPERS ====================
-def tg_send(text: str, parse_mode: str = "HTML") -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_ADMIN_ID,
-            "text": text[:4000],
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        r = requests.post(url, json=payload, timeout=15)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"tg_send error: {e}")
-        return False
+def get_settings() -> Dict:
+    return {
+        "trade_amount": float(db_get("trade_amount", str(DEFAULT_TRADE_AMOUNT))),
+        "paper_mode": db_get("paper_mode", "1") == "1",
+        "trading_enabled": db_get("trading_enabled", "0") == "1",
+        "max_positions": int(db_get("max_positions", str(DEFAULT_MAX_POS))),
+        "tp1_pct": float(db_get("tp1_pct", "5")),
+        "tp2_pct": float(db_get("tp2_pct", "10")),
+        "tp3_pct": float(db_get("tp3_pct", "15")),
+    }
 
-def tg_get_updates(offset: int = 0) -> List[Dict]:
+# ==================== TELEGRAM (with Inline Buttons) ====================
+def tg_api(method: str, payload: dict = None) -> Optional[dict]:
     if not TELEGRAM_BOT_TOKEN:
-        return []
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        params = {"offset": offset, "timeout": 10, "limit": 20}
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.post(url, json=payload or {}, timeout=20)
         if r.status_code == 200:
-            return r.json().get("result", [])
+            return r.json()
+        logger.warning(f"TG API {method} status {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        logger.debug(f"getUpdates error: {e}")
-    return []
+        logger.error(f"TG API error: {e}")
+    return None
 
-# ==================== CHANNEL SCRAPER (Web Preview only) ====================
-def scrape_channel() -> List[Dict]:
-    """Fetch latest messages from public channel web preview. No login, no API."""
+def tg_send(text: str, reply_markup: dict = None, chat_id: str = None) -> bool:
+    cid = chat_id or TELEGRAM_ADMIN_ID
+    if not cid:
+        return False
+    payload = {
+        "chat_id": cid,
+        "text": text[:4000],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = tg_api("sendMessage", payload)
+    return bool(res and res.get("ok"))
+
+def tg_edit(chat_id: str, message_id: int, text: str, reply_markup: dict = None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:4000],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    tg_api("editMessageText", payload)
+
+def tg_answer_callback(callback_id: str, text: str = ""):
+    tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200]})
+
+def main_menu_keyboard() -> dict:
+    s = get_settings()
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"{'🟢' if s['trading_enabled'] else '🔴'} التداول: {'ON' if s['trading_enabled'] else 'OFF'}", "callback_data": "toggle_trading"},
+                {"text": f"{'📝' if s['paper_mode'] else '💰'} Paper: {'ON' if s['paper_mode'] else 'OFF'}", "callback_data": "toggle_paper"},
+            ],
+            [
+                {"text": f"💵 المبلغ: {s['trade_amount']} USDT", "callback_data": "set_amount"},
+                {"text": f"📊 حد الصفقات: {s['max_positions']}", "callback_data": "set_maxpos"},
+            ],
+            [
+                {"text": f"🎯 TP1: {s['tp1_pct']}%", "callback_data": "set_tp1"},
+                {"text": f"🎯 TP2: {s['tp2_pct']}%", "callback_data": "set_tp2"},
+                {"text": f"🎯 TP3: {s['tp3_pct']}%", "callback_data": "set_tp3"},
+            ],
+            [
+                {"text": "📈 الصفقات المفتوحة", "callback_data": "positions"},
+                {"text": "💰 الرصيد", "callback_data": "balance"},
+            ],
+            [
+                {"text": "📡 القنوات", "callback_data": "channels"},
+                {"text": "📜 آخر الإشارات", "callback_data": "last_signals"},
+            ],
+            [
+                {"text": "⚙️ الإعدادات", "callback_data": "settings"},
+                {"text": "🛑 Kill Switch", "callback_data": "kill"},
+            ],
+            [
+                {"text": "🔄 تحديث", "callback_data": "refresh"},
+            ],
+        ]
+    }
+
+def amount_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "5", "callback_data": "amt_5"},
+                {"text": "10", "callback_data": "amt_10"},
+                {"text": "15", "callback_data": "amt_15"},
+                {"text": "20", "callback_data": "amt_20"},
+            ],
+            [
+                {"text": "25", "callback_data": "amt_25"},
+                {"text": "50", "callback_data": "amt_50"},
+                {"text": "100", "callback_data": "amt_100"},
+            ],
+            [{"text": "🔙 رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+def maxpos_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "1", "callback_data": "maxpos_1"},
+                {"text": "2", "callback_data": "maxpos_2"},
+                {"text": "3", "callback_data": "maxpos_3"},
+                {"text": "5", "callback_data": "maxpos_5"},
+            ],
+            [
+                {"text": "7", "callback_data": "maxpos_7"},
+                {"text": "10", "callback_data": "maxpos_10"},
+            ],
+            [{"text": "🔙 رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+def tp_keyboard(which: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "3%", "callback_data": f"tp_{which}_3"},
+                {"text": "5%", "callback_data": f"tp_{which}_5"},
+                {"text": "7%", "callback_data": f"tp_{which}_7"},
+                {"text": "10%", "callback_data": f"tp_{which}_10"},
+            ],
+            [
+                {"text": "12%", "callback_data": f"tp_{which}_12"},
+                {"text": "15%", "callback_data": f"tp_{which}_15"},
+                {"text": "20%", "callback_data": f"tp_{which}_20"},
+            ],
+            [{"text": "🔙 رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+def channels_keyboard() -> dict:
+    conn = get_db()
+    rows = conn.execute("SELECT username, enabled FROM channels ORDER BY id").fetchall()
+    conn.close()
+    buttons = []
+    for r in rows:
+        status = "✅" if r["enabled"] else "❌"
+        buttons.append([{"text": f"{status} @{r['username']}", "callback_data": f"ch_toggle_{r['username']}"}])
+        buttons.append([{"text": f"🗑 حذف @{r['username']}", "callback_data": f"ch_del_{r['username']}"}])
+    buttons.append([{"text": "➕ إضافة قناة", "callback_data": "ch_add"}])
+    buttons.append([{"text": "🔙 رجوع", "callback_data": "menu"}])
+    return {"inline_keyboard": buttons}
+
+# ==================== CHANNEL SCRAPER ====================
+def scrape_channel(username: str) -> List[Dict]:
+    url = f"https://t.me/s/{username}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
     }
     try:
-        r = requests.get(CHANNEL_URL, headers=headers, timeout=20)
+        r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         messages = []
@@ -147,7 +333,6 @@ def scrape_channel() -> List[Dict]:
             msg = wrap.select_one(".tgme_widget_message")
             if not msg:
                 continue
-            # Message ID from data-post="channel/12345"
             data_post = msg.get("data-post", "")
             msg_id = 0
             if "/" in data_post:
@@ -156,7 +341,6 @@ def scrape_channel() -> List[Dict]:
                 except:
                     pass
             if msg_id == 0:
-                # fallback from link
                 link = msg.select_one("a.tgme_widget_message_date")
                 if link and link.get("href"):
                     m = re.search(r"/(\d+)$", link["href"])
@@ -165,124 +349,134 @@ def scrape_channel() -> List[Dict]:
             text_el = msg.select_one(".tgme_widget_message_text")
             text = text_el.get_text("\n", strip=True) if text_el else ""
             if msg_id > 0 and text:
-                messages.append({"id": msg_id, "text": text})
-        # newest first usually, sort ascending by id
+                messages.append({"id": msg_id, "text": text, "channel": username})
         messages.sort(key=lambda x: x["id"])
         return messages
     except Exception as e:
-        logger.error(f"Scrape error: {e}")
+        logger.error(f"Scrape @{username}: {e}")
         return []
 
-# ==================== SIGNAL PARSER (flexible) ====================
+# ==================== FLEXIBLE PARSER (Arabic + English) ====================
 def normalize_symbol(raw: str) -> Optional[str]:
     if not raw:
         return None
     s = raw.upper().strip()
-    s = re.sub(r"[#$]", "", s)
-    s = s.replace("USDT", "").replace("USD", "").replace("/", "").replace("-", "")
+    s = re.sub(r"[#$“”\"']", "", s)
+    s = s.replace("USDT", "").replace("USD", "").replace("/", "").replace("-", "").replace(".", "")
     s = re.sub(r"[^A-Z0-9]", "", s)
     if len(s) < 2 or len(s) > 15:
+        return None
+    # common noise
+    if s in ("SPOT", "LONG", "SHORT", "SIGN", "SWING", "ENTER", "TARGET", "STOP", "LEVERAGE"):
         return None
     return f"{s}/USDT"
 
 def parse_signal(text: str) -> Optional[Dict]:
-    """Flexible parser. Returns None if not a clear trading signal."""
-    if not text or len(text) < 10:
+    if not text or len(text) < 8:
         return None
     original = text
     text_lower = text.lower()
+    text_clean = text.replace("\n", " ")
 
-    # Must look like a signal
-    has_direction = bool(re.search(r"\b(long|short|buy|sell)\b", text_lower))
-    has_price_like = bool(re.search(r"\d+\.?\d*", text))
-    if not (has_direction and has_price_like):
-        return None
-
-    # Direction
+    # Direction detection (Arabic + English)
     direction = None
-    if re.search(r"\b(long|buy|شراء|لونج)\b", text_lower):
+    if re.search(r"\b(long|buy|لونج|شراء|سبوت|spot)\b", text_lower) or "🟢" in text:
         direction = "LONG"
-    elif re.search(r"\b(short|sell|بيع|شورت)\b", text_lower):
-        direction = "SHORT"
+    elif re.search(r"\b(short|sell|شورت|بيع)\b", text_lower) or "🔴" in text and "long" not in text_lower:
+        # only mark short if explicit
+        if re.search(r"\b(short|شورت)\b", text_lower):
+            direction = "SHORT"
     if not direction:
-        return None
+        # if has entry + target + stop → assume LONG for this channel style
+        if re.search(r"(دخول|enter|entry|هدف|target|وقف|stop)", text_lower):
+            direction = "LONG"
+        else:
+            return None
 
-    # Leverage (ignored later)
+    # Leverage (ignored)
     lev_match = re.search(r"(?:leverage|lev|x|×)\s*[:=]?\s*(\d+)", text_lower)
     leverage = int(lev_match.group(1)) if lev_match else None
 
-    # Prices
     def find_price(patterns):
         for p in patterns:
-            m = re.search(p, text, re.IGNORECASE)
+            m = re.search(p, text, re.IGNORECASE | re.DOTALL)
             if m:
                 try:
-                    return float(m.group(1).replace(",", ""))
+                    val = m.group(1).replace(",", "").replace("..", "").strip()
+                    # handle 0.18.. style
+                    val = re.sub(r"\.+$", "", val)
+                    return float(val)
                 except:
                     pass
         return None
 
     entry = find_price([
-        r"(?:enter|entry|دخول|سعر الدخول|entry\s*price)\s*[:=]?\s*([\d.]+)",
-        r"(?:enter|entry)\s+([\d.]+)",
+        r"(?:الدخول من السعر الحالي|دخول|enter|entry|سعر الدخول)\s*[:=]?\s*([\d.]+)",
+        r"(?:enter|entry)\s*[:=]?\s*([\d.]+)",
+        r"الدخول\s*[:=]?\s*([\d.]+)",
     ])
     target = find_price([
-        r"(?:target|tp|هدف|تارجيت|take\s*profit)\s*[:=]?\s*([\d.]+)",
-        r"(?:target|tp)\s+([\d.]+)",
+        r"(?:الهدف الاول|الهدف الأول|هدف اول|target|tp|تارجيت|الهدف)\s*[:=]?\s*([\d.]+)",
+        r"(?:target|tp)\s*[:=]?\s*([\d.]+)",
+        r"الهدف\s*[:=]?\s*([\d.]+)",
     ])
     stop = find_price([
-        r"(?:stop|sl|وقف|ستوب|stop\s*loss)\s*[:=]?\s*([\d.]+)",
-        r"(?:stop|sl)\s+([\d.]+)",
+        r"(?:الوقف|وقف|stop|sl|ستوب)\s*(?:اغلاق يوم اسفل|إغلاق يوم أسفل)?\s*[:=]?\s*([\d.]+)",
+        r"(?:stop|sl)\s*[:=]?\s*([\d.]+)",
+        r"الوقف\s*[:=]?\s*([\d.]+)",
     ])
 
-    # Symbol - smart extraction
+    # Symbol extraction – improved for both styles
     symbol = None
-    # Try common patterns first
-    patterns = [
-        r"(?:#|\$)?([A-Z]{2,12})(?:USDT|/USDT|\s+USDT)?",
-        r"([A-Z]{2,12})\s*/\s*USDT",
-        r"pair\s*[:=]?\s*([A-Z0-9]+)",
-        r"coin\s*[:=]?\s*([A-Z0-9]+)",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+    # 1. Explicit patterns
+    for p in [
+        r"(?:#|\$)?([A-Za-z]{2,12})\s*(?:USDT|/USDT)?",
+        r"([A-Za-z]{2,12})\s*/\s*USDT",
+        r"^([A-Za-z]{2,12})\s*[🔥🟢]",
+        r"([A-Za-z]{2,12})\s+🔥",
+    ]:
+        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
         if m:
             candidate = normalize_symbol(m.group(1))
             if candidate:
                 symbol = candidate
                 break
 
-    # Fallback: look for all-caps words that look like tickers
+    # 2. First meaningful word that looks like ticker
     if not symbol:
-        candidates = re.findall(r"\b([A-Z]{2,10})\b", text)
-        for c in candidates:
-            if c not in ("LONG", "SHORT", "USDT", "USD", "ENTER", "TARGET", "STOP", "LEVERAGE", "SIGN"):
-                candidate = normalize_symbol(c)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines[:5]:
+            # remove emojis and noise
+            clean = re.sub(r"[^\w\s/]", " ", ln)
+            words = clean.split()
+            for w in words:
+                candidate = normalize_symbol(w)
                 if candidate:
                     symbol = candidate
                     break
+            if symbol:
+                break
 
-    if not symbol or not direction:
+    if not symbol:
         return None
 
-    # Basic validation
-    if entry and entry <= 0:
+    # Must have at least some price info or clear direction
+    if not any([entry, target, stop]) and direction != "LONG":
         return None
 
-    signal = {
+    return {
         "symbol": symbol,
         "direction": direction,
         "leverage": leverage,
         "entry": entry,
-        "target": target,
+        "target": target,   # used as reference if present
         "stop": stop,
-        "raw": original[:500],
+        "raw": original[:600],
     }
-    return signal
 
-def signal_hash(sig: Dict, msg_id: int) -> str:
-    s = f"{msg_id}|{sig['symbol']}|{sig['direction']}|{sig.get('entry')}|{sig.get('target')}|{sig.get('stop')}"
-    return hashlib.sha256(s.encode()).hexdigest()[:16]
+def signal_key(channel: str, msg_id: int, sig: Dict) -> str:
+    s = f"{channel}|{msg_id}|{sig['symbol']}|{sig['direction']}|{sig.get('entry')}|{sig.get('stop')}"
+    return hashlib.sha256(s.encode()).hexdigest()[:20]
 
 # ==================== MEXC SPOT ====================
 exchange: Optional[ccxt.Exchange] = None
@@ -290,19 +484,18 @@ exchange: Optional[ccxt.Exchange] = None
 def init_exchange() -> bool:
     global exchange
     if not MEXC_API_KEY or not MEXC_SECRET_KEY:
-        logger.warning("MEXC keys missing - exchange not initialized")
+        logger.warning("MEXC keys missing")
         return False
     try:
         exchange = ccxt.mexc({
             "apiKey": MEXC_API_KEY,
             "secret": MEXC_SECRET_KEY,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},  # CRITICAL: spot only
+            "options": {"defaultType": "spot"},
         })
         exchange.load_markets()
-        # sanity check
-        bal = exchange.fetch_balance()
-        logger.info("MEXC Spot connected successfully")
+        exchange.fetch_balance()
+        logger.info("MEXC Spot connected")
         return True
     except Exception as e:
         logger.error(f"MEXC init failed: {e}")
@@ -322,47 +515,39 @@ def get_usdt_balance() -> float:
 def market_exists(symbol: str) -> bool:
     if not exchange:
         return False
-    return symbol in exchange.markets and exchange.markets[symbol].get("spot", False)
+    m = exchange.markets.get(symbol)
+    return bool(m and m.get("spot", False))
 
 def calculate_amount(symbol: str, usdt_amount: float) -> Optional[float]:
-    """Return base amount that respects precision, min amount, min cost."""
     if not exchange or not market_exists(symbol):
         return None
     try:
         market = exchange.markets[symbol]
         ticker = exchange.fetch_ticker(symbol)
-        price = float(ticker["last"] or ticker.get("close") or 0)
+        price = float(ticker.get("last") or ticker.get("close") or 0)
         if price <= 0:
             return None
         amount = usdt_amount / price
-        # precision
         amount = float(exchange.amount_to_precision(symbol, amount))
-        min_amount = market.get("limits", {}).get("amount", {}).get("min") or 0
-        min_cost = market.get("limits", {}).get("cost", {}).get("min") or 0
-        if amount < min_amount:
-            logger.warning(f"Amount {amount} < min_amount {min_amount}")
-            return None
-        cost = amount * price
-        if cost < min_cost:
-            logger.warning(f"Cost {cost} < min_cost {min_cost}")
+        min_amount = (market.get("limits") or {}).get("amount", {}).get("min") or 0
+        min_cost = (market.get("limits") or {}).get("cost", {}).get("min") or 0
+        if amount < min_amount or (amount * price) < min_cost:
             return None
         return amount
     except Exception as e:
-        logger.error(f"calculate_amount error: {e}")
+        logger.error(f"calc amount: {e}")
         return None
 
-def execute_spot_buy(symbol: str, usdt_amount: float, signal: Dict) -> Optional[Dict]:
-    """Real or paper SPOT market buy."""
-    if state.paper_mode:
-        # simulate
-        price = signal.get("entry") or 0
-        if not price and exchange and market_exists(symbol):
+def execute_spot_buy(symbol: str, usdt_amount: float, paper: bool) -> Optional[Dict]:
+    if paper:
+        price = 0.0
+        if exchange and market_exists(symbol):
             try:
                 price = float(exchange.fetch_ticker(symbol)["last"])
             except:
                 price = 1.0
         qty = usdt_amount / price if price > 0 else 0
-        order = {
+        return {
             "id": f"PAPER-{int(time.time())}",
             "symbol": symbol,
             "side": "buy",
@@ -372,33 +557,24 @@ def execute_spot_buy(symbol: str, usdt_amount: float, signal: Dict) -> Optional[
             "status": "closed",
             "paper": True,
         }
-        logger.info(f"[PAPER] BUY {symbol} ~{qty:.6f} @ {price}")
-        return order
-
-    if not exchange:
-        return None
-    if not market_exists(symbol):
-        logger.error(f"Symbol {symbol} not in MEXC Spot")
+    if not exchange or not market_exists(symbol):
         return None
     amount = calculate_amount(symbol, usdt_amount)
     if not amount:
         return None
-    free = get_usdt_balance()
-    if free < usdt_amount * 1.01:  # small buffer
-        logger.error(f"Insufficient USDT: {free} < {usdt_amount}")
+    if get_usdt_balance() < usdt_amount * 1.01:
         return None
     try:
         order = exchange.create_order(symbol, "market", "buy", amount)
-        logger.info(f"SPOT BUY executed: {order.get('id')}")
         return order
     except Exception as e:
-        logger.error(f"Order failed: {e}")
-        tg_send(f"❌ ERROR\nOrder failed for {symbol}\n{str(e)[:300]}")
+        logger.error(f"Buy failed: {e}")
+        tg_send(f"❌ خطأ في الشراء\n{symbol}\n{str(e)[:250]}")
         return None
 
-def execute_spot_sell(symbol: str, amount: float, reason: str) -> Optional[Dict]:
-    if state.paper_mode:
-        order = {
+def execute_spot_sell(symbol: str, amount: float, reason: str, paper: bool) -> Optional[Dict]:
+    if paper:
+        return {
             "id": f"PAPER-SELL-{int(time.time())}",
             "symbol": symbol,
             "side": "sell",
@@ -407,364 +583,546 @@ def execute_spot_sell(symbol: str, amount: float, reason: str) -> Optional[Dict]
             "paper": True,
             "reason": reason,
         }
-        logger.info(f"[PAPER] SELL {symbol} {amount} reason={reason}")
-        return order
     if not exchange:
         return None
     try:
         amount = float(exchange.amount_to_precision(symbol, amount))
+        if amount <= 0:
+            return None
         order = exchange.create_order(symbol, "market", "sell", amount)
-        logger.info(f"SPOT SELL executed: {order.get('id')} reason={reason}")
         return order
     except Exception as e:
         logger.error(f"Sell failed: {e}")
-        tg_send(f"❌ ERROR\nSell failed {symbol}\n{str(e)[:300]}")
+        tg_send(f"❌ خطأ في البيع\n{symbol}\n{str(e)[:250]}")
         return None
 
-# ==================== POSITION MANAGEMENT ====================
-def open_position(signal: Dict, order: Dict):
-    symbol = signal["symbol"]
-    qty = float(order.get("amount") or order.get("filled") or 0)
-    price = float(order.get("price") or order.get("average") or signal.get("entry") or 0)
-    state.positions[symbol] = {
-        "symbol": symbol,
-        "qty": qty,
-        "entry_price": price,
-        "target": signal.get("target"),
-        "stop": signal.get("stop"),
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-        "order_id": order.get("id"),
-        "paper": state.paper_mode,
-        "signal": signal,
-    }
-    state.save()
+# ==================== POSITIONS & TRAILING ====================
+def count_open_positions() -> int:
+    conn = get_db()
+    n = conn.execute("SELECT COUNT(*) as c FROM positions WHERE status='open'").fetchone()["c"]
+    conn.close()
+    return n
 
-def check_positions():
-    if not state.positions:
-        return
-    to_close = []
-    for symbol, pos in list(state.positions.items()):
+def open_position(sig: Dict, order: Dict, settings: Dict):
+    symbol = sig["symbol"]
+    qty = float(order.get("amount") or order.get("filled") or 0)
+    price = float(order.get("price") or order.get("average") or sig.get("entry") or 0)
+    if price <= 0:
+        price = 1.0
+
+    # Calculate 3 TPs from percentages
+    tp1 = price * (1 + settings["tp1_pct"] / 100)
+    tp2 = price * (1 + settings["tp2_pct"] / 100)
+    tp3 = price * (1 + settings["tp3_pct"] / 100)
+
+    # If signal has a target, use it as TP1 (override)
+    if sig.get("target") and sig["target"] > price:
+        tp1 = float(sig["target"])
+        # keep relative spacing or leave tp2/tp3 as %
+
+    # Initial SL from signal (mandatory preference)
+    sl = float(sig["stop"]) if sig.get("stop") and sig["stop"] > 0 else price * 0.95
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO positions (
+            symbol, qty, remaining_qty, entry_price, stop_loss, current_sl,
+            tp1, tp2, tp3, order_id, signal_raw, opened_at, paper, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+    """, (
+        symbol, qty, qty, price, sl, sl,
+        tp1, tp2, tp3,
+        str(order.get("id")),
+        sig.get("raw", "")[:500],
+        datetime.now(timezone.utc).isoformat(),
+        1 if settings["paper_mode"] else 0,
+    ))
+    conn.commit()
+    conn.close()
+
+def check_and_manage_positions():
+    settings = get_settings()
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+    conn.close()
+
+    for row in rows:
         try:
-            if state.paper_mode or not exchange:
-                # simple paper check using last known or skip real price
-                current = pos.get("entry_price", 0)
+            symbol = row["symbol"]
+            remaining = float(row["remaining_qty"])
+            if remaining <= 0:
+                continue
+
+            # Get current price
+            if settings["paper_mode"] or not exchange:
+                current = float(row["entry_price"])  # paper: no real move unless you want simulation
+                # simple paper simulation could be improved later
+                continue  # skip real TP check in pure paper for safety, or implement fake
             else:
                 ticker = exchange.fetch_ticker(symbol)
                 current = float(ticker["last"])
-            target = pos.get("target")
-            stop = pos.get("stop")
-            reason = None
-            if target and current >= target:
-                reason = "TARGET"
-            elif stop and current <= stop:
-                reason = "STOP"
-            if reason:
-                order = execute_spot_sell(symbol, pos["qty"], reason)
-                if order:
-                    to_close.append(symbol)
-                    msg = f"{'🎯 TARGET HIT' if reason == 'TARGET' else '🛑 STOP HIT'}\n"
-                    msg += f"Coin: {symbol}\nPrice: {current}\nQty: {pos['qty']}\n"
-                    if state.paper_mode:
-                        msg += "(PAPER MODE)"
-                    tg_send(msg)
-        except Exception as e:
-            logger.error(f"Position check {symbol}: {e}")
-    for s in to_close:
-        del state.positions[s]
-    if to_close:
-        state.save()
 
-# ==================== PROCESS NEW SIGNAL ====================
+            entry = float(row["entry_price"])
+            tp1, tp2, tp3 = float(row["tp1"]), float(row["tp2"]), float(row["tp3"])
+            current_sl = float(row["current_sl"])
+            paper = bool(row["paper"])
+
+            # Stop Loss hit
+            if current <= current_sl:
+                order = execute_spot_sell(symbol, remaining, "STOP", paper)
+                if order:
+                    close_position(row["id"], remaining, current, "STOP", paper)
+                    tg_send(f"🛑 STOP HIT\n{symbol}\nPrice: {current}\nSL: {current_sl}")
+                continue
+
+            # TP3 full close
+            if not row["tp3_hit"] and current >= tp3:
+                order = execute_spot_sell(symbol, remaining, "TP3", paper)
+                if order:
+                    close_position(row["id"], remaining, current, "TP3", paper)
+                    tg_send(f"🎯🎯🎯 TP3 HIT (Full)\n{symbol}\nPrice: {current}")
+                continue
+
+            # TP2 partial (close half of remaining)
+            if not row["tp2_hit"] and current >= tp2:
+                sell_qty = remaining * 0.5
+                order = execute_spot_sell(symbol, sell_qty, "TP2", paper)
+                if order:
+                    new_remaining = remaining - sell_qty
+                    # trail SL to TP1
+                    new_sl = tp1
+                    update_position_after_tp(row["id"], new_remaining, new_sl, tp2_hit=True)
+                    tg_send(f"🎯🎯 TP2 HIT\n{symbol}\nClosed: {sell_qty:.6f}\nNew SL → {new_sl}")
+                continue
+
+            # TP1 partial (close 1/3 of original or remaining)
+            if not row["tp1_hit"] and current >= tp1:
+                sell_qty = remaining * 0.34
+                order = execute_spot_sell(symbol, sell_qty, "TP1", paper)
+                if order:
+                    new_remaining = remaining - sell_qty
+                    # trail SL to Entry (breakeven)
+                    new_sl = entry
+                    update_position_after_tp(row["id"], new_remaining, new_sl, tp1_hit=True)
+                    tg_send(f"🎯 TP1 HIT\n{symbol}\nClosed: {sell_qty:.6f}\nSL moved to Entry: {entry}")
+                continue
+
+        except Exception as e:
+            logger.error(f"Position manage {row['symbol']}: {e}")
+
+def update_position_after_tp(pos_id: int, new_qty: float, new_sl: float, tp1_hit=False, tp2_hit=False):
+    conn = get_db()
+    if tp1_hit:
+        conn.execute(
+            "UPDATE positions SET remaining_qty=?, current_sl=?, tp1_hit=1 WHERE id=?",
+            (new_qty, new_sl, pos_id)
+        )
+    if tp2_hit:
+        conn.execute(
+            "UPDATE positions SET remaining_qty=?, current_sl=?, tp2_hit=1 WHERE id=?",
+            (new_qty, new_sl, pos_id)
+        )
+    conn.commit()
+    conn.close()
+
+def close_position(pos_id: int, qty: float, price: float, reason: str, paper: bool):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+    if row:
+        entry = float(row["entry_price"])
+        pnl = (price - entry) * qty
+        conn.execute(
+            "UPDATE positions SET remaining_qty=0, status='closed' WHERE id=?",
+            (pos_id,)
+        )
+        conn.execute("""
+            INSERT INTO trades_history (symbol, side, qty, price, pnl, reason, paper, closed_at)
+            VALUES (?, 'sell', ?, ?, ?, ?, ?, ?)
+        """, (
+            row["symbol"], qty, price, pnl, reason, 1 if paper else 0,
+            datetime.now(timezone.utc).isoformat()
+        ))
+    conn.commit()
+    conn.close()
+
+# ==================== PROCESS SIGNAL ====================
+def already_processed(key: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM processed WHERE msg_key=?", (key,)).fetchone()
+    conn.close()
+    return bool(row)
+
+def mark_processed(key: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO processed (msg_key, processed_at) VALUES (?, ?)",
+        (key, datetime.now(timezone.utc).isoformat())
+    )
+    # keep table small
+    conn.execute("DELETE FROM processed WHERE rowid NOT IN (SELECT rowid FROM processed ORDER BY processed_at DESC LIMIT 500)")
+    conn.commit()
+    conn.close()
+
 def process_signal(msg: Dict):
+    settings = get_settings()
+    channel = msg["channel"]
     msg_id = msg["id"]
     text = msg["text"]
-    if msg_id <= state.last_msg_id:
-        return
+
     sig = parse_signal(text)
     if not sig:
-        state.last_msg_id = max(state.last_msg_id, msg_id)
-        state.save()
         return
 
-    h = signal_hash(sig, msg_id)
-    if h in state.processed_hashes:
-        logger.info(f"Duplicate hash {h}, skip")
-        state.last_msg_id = max(state.last_msg_id, msg_id)
-        state.save()
+    key = signal_key(channel, msg_id, sig)
+    if already_processed(key):
         return
+    mark_processed(key)
 
-    # Only LONG
+    # Update last_msg_id for channel
+    conn = get_db()
+    conn.execute(
+        "UPDATE channels SET last_msg_id = MAX(last_msg_id, ?) WHERE username=?",
+        (msg_id, channel)
+    )
+    conn.commit()
+    conn.close()
+
     if sig["direction"] != "LONG":
-        logger.info(f"Ignoring SHORT signal {sig['symbol']}")
-        state.processed_hashes.append(h)
-        state.last_msg_id = max(state.last_msg_id, msg_id)
-        state.save()
-        tg_send(f"ℹ️ Signal ignored (SHORT)\n{sig['symbol']}")
+        tg_send(f"ℹ️ إشارة SHORT تم تجاهلها\n{sig['symbol']}\nمن @{channel}")
         return
-
-    logger.info(f"🔥 NEW SIGNAL DETECTED | {sig['symbol']} LONG")
-    state.last_signal = sig
-    state.processed_hashes.append(h)
-    state.last_msg_id = max(state.last_msg_id, msg_id)
-    state.save()
 
     # Notify
-    lev_txt = f"{sig['leverage']}x (ignored)" if sig.get("leverage") else "none"
+    lev = f"{sig['leverage']}x (مهمل)" if sig.get("leverage") else "لا يوجد"
     notify = (
-        f"🚨 توصية جديدة\n\n"
-        f"Coin: <b>{sig['symbol']}</b>\n"
-        f"Signal: LONG\n"
-        f"Entry: {sig.get('entry') or 'market'}\n"
-        f"Target: {sig.get('target') or '-'}\n"
-        f"Stop: {sig.get('stop') or '-'}\n"
-        f"Leverage in signal: {lev_txt}\n"
-        f"Mode: SPOT\n"
-        f"Paper: {state.paper_mode}\n"
-        f"Trading: {state.trading_enabled}"
+        f"🚨 توصية جديدة من @{channel}\n\n"
+        f"العملية: <b>{sig['symbol']}</b>\n"
+        f"النوع: LONG → SPOT BUY\n"
+        f"الدخول: {sig.get('entry') or 'السوق'}\n"
+        f"الهدف من الإشارة: {sig.get('target') or '-'}\n"
+        f"الوقف من الإشارة: {sig.get('stop') or '-'}\n"
+        f"الرافعة: {lev}\n"
+        f"Paper: {settings['paper_mode']}\n"
+        f"التداول: {settings['trading_enabled']}"
     )
     tg_send(notify)
 
-    if not state.trading_enabled:
-        logger.info("Trading disabled - signal recorded only")
+    if not settings["trading_enabled"]:
         return
 
-    # Safety checks
-    amount = min(state.trade_amount, MAX_TRADE_AMOUNT)
+    if count_open_positions() >= settings["max_positions"]:
+        tg_send(f"⚠️ تم الوصول لحد الصفقات المفتوحة ({settings['max_positions']})")
+        return
+
+    amount = min(settings["trade_amount"], MAX_TRADE_HARD_LIMIT)
     if amount <= 0:
-        tg_send("❌ ERROR: trade amount invalid")
         return
 
-    if not state.paper_mode:
+    if not settings["paper_mode"]:
         if not exchange:
-            tg_send("❌ ERROR: MEXC not connected")
+            tg_send("❌ MEXC غير متصل")
             return
         if not market_exists(sig["symbol"]):
-            tg_send(f"❌ ERROR: {sig['symbol']} not available on MEXC Spot")
+            tg_send(f"❌ {sig['symbol']} غير موجود في MEXC Spot")
             return
         if get_usdt_balance() < amount * 1.02:
-            tg_send(f"❌ ERROR: Insufficient USDT balance")
+            tg_send("❌ رصيد USDT غير كافٍ")
             return
 
-    # Execute
-    logger.info(f"Executing SPOT BUY {sig['symbol']} amount={amount} USDT")
-    order = execute_spot_buy(sig["symbol"], amount, sig)
+    order = execute_spot_buy(sig["symbol"], amount, settings["paper_mode"])
     if order:
-        open_position(sig, order)
-        fill_price = order.get("price") or order.get("average") or sig.get("entry")
+        open_position(sig, order, settings)
+        price = order.get("price") or order.get("average") or sig.get("entry")
         qty = order.get("amount") or order.get("filled")
-        confirm = (
+        tg_send(
             f"✅ تم تنفيذ SPOT BUY\n\n"
-            f"Coin: <b>{sig['symbol']}</b>\n"
-            f"Amount: {amount} USDT\n"
-            f"Quantity: {qty}\n"
-            f"Price: {fill_price}\n"
-            f"Order ID: {order.get('id')}\n"
-            f"{'(PAPER MODE)' if state.paper_mode else ''}"
+            f"<b>{sig['symbol']}</b>\n"
+            f"المبلغ: {amount} USDT\n"
+            f"الكمية: {qty}\n"
+            f"السعر: {price}\n"
+            f"Order: {order.get('id')}\n"
+            f"{'(PAPER)' if settings['paper_mode'] else ''}"
         )
-        tg_send(confirm)
     else:
-        tg_send(f"❌ ERROR: Failed to execute buy for {sig['symbol']}")
+        tg_send(f"❌ فشل تنفيذ الشراء لـ {sig['symbol']}")
 
-# ==================== BOT COMMANDS ====================
-last_update_id = 0
+# ==================== BOT HANDLERS ====================
+waiting_for: Dict[str, str] = {}  # admin_id -> "add_channel" etc.
 
-def handle_command(text: str, chat_id: str):
-    global last_update_id
-    if str(chat_id) != str(TELEGRAM_ADMIN_ID):
+def handle_callback(cq: dict):
+    data = cq.get("data", "")
+    cq_id = cq["id"]
+    msg = cq.get("message", {})
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    message_id = msg.get("message_id")
+    if chat_id != TELEGRAM_ADMIN_ID:
+        tg_answer_callback(cq_id, "غير مصرح")
         return
-    cmd = text.strip().split()
-    if not cmd:
-        return
-    c = cmd[0].lower()
 
-    if c == "/start":
-        tg_send(
-            "🤖 MEXC SPOT Auto Trader\n\n"
-            "Commands:\n"
-            "/status /on /off /balance /positions\n"
-            "/amount <n> /paper /settings /last /stop\n"
-            "/test"
+    tg_answer_callback(cq_id)
+
+    if data == "menu" or data == "refresh":
+        s = get_settings()
+        text = (
+            f"🤖 <b>MEXC SPOT Trader</b>\n\n"
+            f"التداول: {'🟢 ON' if s['trading_enabled'] else '🔴 OFF'}\n"
+            f"Paper: {'📝 ON' if s['paper_mode'] else '💰 OFF'}\n"
+            f"المبلغ: {s['trade_amount']} USDT\n"
+            f"حد الصفقات: {s['max_positions']}\n"
+            f"TPs: {s['tp1_pct']}% / {s['tp2_pct']}% / {s['tp3_pct']}%\n"
+            f"صفقات مفتوحة: {count_open_positions()}"
         )
-    elif c == "/status":
-        mexc_ok = "✅" if exchange else "❌"
-        bal = get_usdt_balance() if exchange else 0
-        msg = (
-            f"📊 STATUS\n\n"
-            f"Trading: {'ON ✅' if state.trading_enabled else 'OFF ⛔'}\n"
-            f"Paper Mode: {'ON 📝' if state.paper_mode else 'OFF 🔴'}\n"
-            f"MEXC: {mexc_ok}\n"
-            f"Channel: @{CHANNEL}\n"
-            f"Trade Amount: {state.trade_amount} USDT\n"
-            f"Last Msg ID: {state.last_msg_id}\n"
-            f"Open Positions: {len(state.positions)}\n"
-            f"USDT Free: {bal:.2f}\n"
-            f"Last Signal: {state.last_signal['symbol'] if state.last_signal else '-'}"
-        )
-        tg_send(msg)
-    elif c == "/on":
-        state.trading_enabled = True
-        state.save()
-        tg_send("✅ Trading ENABLED")
-    elif c == "/off":
-        state.trading_enabled = False
-        state.save()
-        tg_send("⛔ Trading DISABLED")
-    elif c == "/stop":
-        state.trading_enabled = False
-        state.save()
-        tg_send("🛑 KILL SWITCH - Trading stopped immediately")
-    elif c == "/paper":
-        state.paper_mode = not state.paper_mode
-        state.save()
-        tg_send(f"Paper Mode now: {'ON' if state.paper_mode else 'OFF'}")
-    elif c == "/balance":
-        if not exchange:
-            tg_send("MEXC not connected")
-            return
-        try:
-            bal = exchange.fetch_balance()
-            usdt = bal.get("USDT", {})
-            msg = f"💰 Balance\nUSDT free: {usdt.get('free', 0)}\nUSDT total: {usdt.get('total', 0)}"
-            # show a few non-zero
-            for k, v in list(bal.items())[:15]:
-                if isinstance(v, dict) and float(v.get("total") or 0) > 0 and k != "USDT":
-                    msg += f"\n{k}: {v.get('total')}"
-            tg_send(msg)
-        except Exception as e:
-            tg_send(f"Error: {e}")
-    elif c == "/positions":
-        if not state.positions:
-            tg_send("No open positions")
-            return
-        msg = "📈 Open Positions\n"
-        for s, p in state.positions.items():
-            msg += f"\n{s}\nQty: {p['qty']}\nEntry: {p['entry_price']}\nTP: {p.get('target')}\nSL: {p.get('stop')}\n"
-        tg_send(msg)
-    elif c == "/amount":
-        if len(cmd) < 2:
-            tg_send(f"Current amount: {state.trade_amount} USDT\nUsage: /amount 15")
-            return
-        try:
-            val = float(cmd[1])
-            if val <= 0 or val > MAX_TRADE_AMOUNT:
-                tg_send(f"Amount must be 0 < x <= {MAX_TRADE_AMOUNT}")
-                return
-            state.trade_amount = val
-            state.save()
-            tg_send(f"✅ Trade amount set to {val} USDT")
-        except:
-            tg_send("Invalid number")
-    elif c == "/settings":
-        tg_send(
-            f"Settings\n"
-            f"Amount: {state.trade_amount}\n"
-            f"Paper: {state.paper_mode}\n"
-            f"Trading: {state.trading_enabled}\n"
-            f"Poll: {POLL_INTERVAL}s\n"
-            f"Max amount hard limit: {MAX_TRADE_AMOUNT}"
-        )
-    elif c == "/last":
-        if state.last_signal:
-            s = state.last_signal
-            tg_send(f"Last signal:\n{s['symbol']} {s['direction']}\nEntry: {s.get('entry')}\nTarget: {s.get('target')}\nStop: {s.get('stop')}")
+        tg_edit(chat_id, message_id, text, main_menu_keyboard())
+
+    elif data == "toggle_trading":
+        cur = get_settings()["trading_enabled"]
+        db_set("trading_enabled", "0" if cur else "1")
+        tg_answer_callback(cq_id, "تم التغيير")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data == "toggle_paper":
+        cur = get_settings()["paper_mode"]
+        db_set("paper_mode", "0" if cur else "1")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data == "set_amount":
+        tg_edit(chat_id, message_id, "اختر مبلغ الصفقة (USDT):", amount_keyboard())
+
+    elif data.startswith("amt_"):
+        val = float(data.split("_")[1])
+        db_set("trade_amount", str(val))
+        tg_send(f"✅ تم تعيين المبلغ إلى {val} USDT")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data == "set_maxpos":
+        tg_edit(chat_id, message_id, "اختر الحد الأقصى لعدد الصفقات المفتوحة:", maxpos_keyboard())
+
+    elif data.startswith("maxpos_"):
+        val = int(data.split("_")[1])
+        db_set("max_positions", str(val))
+        tg_send(f"✅ حد الصفقات = {val}")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data.startswith("set_tp"):
+        which = data[-1]  # 1/2/3
+        tg_edit(chat_id, message_id, f"اختر نسبة TP{which}:", tp_keyboard(which))
+
+    elif data.startswith("tp_"):
+        parts = data.split("_")
+        which, pct = parts[1], parts[2]
+        db_set(f"tp{which}_pct", pct)
+        tg_send(f"✅ TP{which} = {pct}%")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data == "positions":
+        conn = get_db()
+        rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+        conn.close()
+        if not rows:
+            text = "لا توجد صفقات مفتوحة"
         else:
-            tg_send("No last signal")
-    elif c == "/test":
-        tg_send("Bot is alive ✅\nScraping channel...")
-        msgs = scrape_channel()
-        tg_send(f"Scraped {len(msgs)} recent messages\nLatest ID: {msgs[-1]['id'] if msgs else 0}")
-    else:
-        tg_send("Unknown command. /start for help")
+            text = "📈 <b>الصفقات المفتوحة</b>\n\n"
+            for r in rows:
+                text += (
+                    f"<b>{r['symbol']}</b>\n"
+                    f"الكمية المتبقية: {r['remaining_qty']:.6f}\n"
+                    f"الدخول: {r['entry_price']}\n"
+                    f"الوقف الحالي: {r['current_sl']}\n"
+                    f"TP1/2/3: {r['tp1']:.4f} / {r['tp2']:.4f} / {r['tp3']:.4f}\n"
+                    f"TP hits: {r['tp1_hit']}/{r['tp2_hit']}/{r['tp3_hit']}\n\n"
+                )
+        tg_edit(chat_id, message_id, text, {"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "menu"}]]})
 
-def poll_bot():
-    global last_update_id
-    updates = tg_get_updates(last_update_id + 1)
-    for u in updates:
-        last_update_id = max(last_update_id, u["update_id"])
-        msg = u.get("message") or u.get("edited_message")
-        if not msg:
-            continue
-        chat_id = str(msg["chat"]["id"])
-        text = msg.get("text", "")
-        if text.startswith("/"):
-            handle_command(text, chat_id)
+    elif data == "balance":
+        if not exchange:
+            text = "MEXC غير متصل"
+        else:
+            bal = get_usdt_balance()
+            text = f"💰 USDT المتاح: <b>{bal:.2f}</b>"
+        tg_edit(chat_id, message_id, text, {"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "menu"}]]})
+
+    elif data == "channels":
+        tg_edit(chat_id, message_id, "📡 إدارة القنوات:", channels_keyboard())
+
+    elif data.startswith("ch_toggle_"):
+        user = data.replace("ch_toggle_", "")
+        conn = get_db()
+        row = conn.execute("SELECT enabled FROM channels WHERE username=?", (user,)).fetchone()
+        if row:
+            new = 0 if row["enabled"] else 1
+            conn.execute("UPDATE channels SET enabled=? WHERE username=?", (new, user))
+            conn.commit()
+        conn.close()
+        handle_callback({"data": "channels", "id": cq_id, "message": msg})
+
+    elif data.startswith("ch_del_"):
+        user = data.replace("ch_del_", "")
+        conn = get_db()
+        conn.execute("DELETE FROM channels WHERE username=?", (user,))
+        conn.commit()
+        conn.close()
+        tg_send(f"تم حذف @{user}")
+        handle_callback({"data": "channels", "id": cq_id, "message": msg})
+
+    elif data == "ch_add":
+        waiting_for[TELEGRAM_ADMIN_ID] = "add_channel"
+        tg_send("أرسل الآن يوزرنيم القناة (مثال: abojasimp أو @abojasimp)\nبدون رابط.")
+        tg_edit(chat_id, message_id, "في انتظار اسم القناة...", {"inline_keyboard": [[{"text": "🔙 إلغاء", "callback_data": "menu"}]]})
+
+    elif data == "settings":
+        s = get_settings()
+        text = (
+            f"⚙️ الإعدادات الحالية\n\n"
+            f"المبلغ: {s['trade_amount']} USDT\n"
+            f"حد الصفقات: {s['max_positions']}\n"
+            f"TP1: {s['tp1_pct']}%\n"
+            f"TP2: {s['tp2_pct']}%\n"
+            f"TP3: {s['tp3_pct']}%\n"
+            f"Paper: {s['paper_mode']}\n"
+            f"Trading: {s['trading_enabled']}"
+        )
+        tg_edit(chat_id, message_id, text, {"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "menu"}]]})
+
+    elif data == "kill":
+        db_set("trading_enabled", "0")
+        tg_send("🛑 Kill Switch تم تفعيله – التداول متوقف فورًا")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+    elif data == "last_signals":
+        tg_send("آخر الإشارات تُعرض عند اكتشافها مباشرة.")
+        handle_callback({"data": "menu", "id": cq_id, "message": msg})
+
+def handle_text_message(text: str, chat_id: str):
+    if chat_id != TELEGRAM_ADMIN_ID:
+        return
+    if chat_id in waiting_for and waiting_for[chat_id] == "add_channel":
+        username = text.strip().lstrip("@").lower()
+        username = re.sub(r"[^a-z0-9_]", "", username)
+        if len(username) < 3:
+            tg_send("اسم قناة غير صالح")
+            return
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
+                (username, datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            tg_send(f"✅ تمت إضافة @{username}")
+        except sqlite3.IntegrityError:
+            tg_send("القناة موجودة مسبقًا")
+        conn.close()
+        del waiting_for[chat_id]
+        return
+
+    # commands
+    if text.startswith("/start") or text.startswith("/menu"):
+        s = get_settings()
+        text_msg = (
+            f"🤖 <b>MEXC SPOT Auto Trader v2</b>\n\n"
+            f"التداول: {'🟢 ON' if s['trading_enabled'] else '🔴 OFF'}\n"
+            f"Paper: {'📝 ON' if s['paper_mode'] else '💰 OFF'}\n"
+            f"المبلغ: {s['trade_amount']} USDT\n"
+            f"حد الصفقات: {s['max_positions']}\n"
+            f"استخدم الأزرار للتحكم الكامل"
+        )
+        tg_send(text_msg, main_menu_keyboard())
+    elif text.startswith("/status"):
+        s = get_settings()
+        tg_send(f"Trading: {s['trading_enabled']} | Paper: {s['paper_mode']} | Amount: {s['trade_amount']} | Open: {count_open_positions()}")
 
 # ==================== MAIN LOOP ====================
+last_update_id = 0
+
+def poll_telegram():
+    global last_update_id
+    res = tg_api("getUpdates", {"offset": last_update_id + 1, "timeout": 10, "limit": 20})
+    if not res or not res.get("ok"):
+        return
+    for u in res.get("result", []):
+        last_update_id = max(last_update_id, u["update_id"])
+        if "callback_query" in u:
+            handle_callback(u["callback_query"])
+        elif "message" in u:
+            msg = u["message"]
+            chat_id = str(msg["chat"]["id"])
+            text = msg.get("text", "")
+            if text:
+                handle_text_message(text, chat_id)
+
+def monitor_channels():
+    conn = get_db()
+    channels = conn.execute("SELECT username, last_msg_id FROM channels WHERE enabled=1").fetchall()
+    conn.close()
+    for ch in channels:
+        username = ch["username"]
+        last_id = ch["last_msg_id"] or 0
+        messages = scrape_channel(username)
+        if not messages:
+            continue
+        # first run for this channel → skip history
+        if last_id == 0:
+            max_id = max(m["id"] for m in messages)
+            conn = get_db()
+            conn.execute("UPDATE channels SET last_msg_id=? WHERE username=?", (max_id, username))
+            conn.commit()
+            conn.close()
+            logger.info(f"@{username} first run → skip history, last_id={max_id}")
+            continue
+        for msg in messages:
+            if msg["id"] > last_id:
+                process_signal(msg)
+
 def print_banner():
-    print("=" * 50)
-    print("MEXC SPOT AUTO TRADER")
-    print()
-    print(f"Telegram Channel: @{CHANNEL}")
-    print("Telegram API ID: NOT USED")
-    print("Telegram API HASH: NOT USED")
-    print()
-    print("Trading Mode: SPOT ONLY")
-    print("Futures: DISABLED")
-    print("Leverage: DISABLED")
-    print("Short: DISABLED")
-    print()
-    print(f"Paper Mode: {str(state.paper_mode).upper()}")
-    print(f"Trading: {'ON' if state.trading_enabled else 'OFF'}")
-    print()
-    print("Bot Control: ACTIVE" if TELEGRAM_BOT_TOKEN else "Bot Control: MISSING TOKEN")
-    print()
-    print("Monitoring channel...")
-    print("=" * 50)
+    s = get_settings()
+    print("=" * 55)
+    print("MEXC SPOT AUTO TRADER v2")
+    print("Telegram API ID / Hash : NOT USED")
+    print("Trading Mode           : SPOT ONLY")
+    print("Futures / Leverage / Short : DISABLED")
+    print(f"Paper Mode             : {s['paper_mode']}")
+    print(f"Trading Enabled        : {s['trading_enabled']}")
+    print(f"Trade Amount           : {s['trade_amount']} USDT")
+    print(f"Max Open Positions     : {s['max_positions']}")
+    print(f"TPs                    : {s['tp1_pct']}% / {s['tp2_pct']}% / {s['tp3_pct']}%")
+    print("Control                : Telegram Bot (Buttons)")
+    print("=" * 55)
 
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
-        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID are required")
+        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID required")
         sys.exit(1)
 
+    init_db()
     print_banner()
     init_exchange()
-    tg_send(
-        f"🚀 Bot started\n"
-        f"Paper: {state.paper_mode}\n"
-        f"Trading: {state.trading_enabled}\n"
-        f"Amount: {state.trade_amount} USDT\n"
-        f"Last Msg ID: {state.last_msg_id}"
-    )
 
-    # On first run (last_msg_id==0) set to current max so we skip old messages
-    if state.last_msg_id == 0:
-        msgs = scrape_channel()
-        if msgs:
-            state.last_msg_id = max(m["id"] for m in msgs)
-            state.save()
-            logger.info(f"First run: set last_msg_id to {state.last_msg_id} (skipping history)")
+    tg_send(
+        "🚀 البوت يعمل الآن\n"
+        f"Paper: {get_settings()['paper_mode']}\n"
+        f"استخدم /start أو الأزرار",
+        main_menu_keyboard()
+    )
 
     consecutive_errors = 0
     while True:
         try:
-            # 1. Poll bot commands
-            poll_bot()
-
-            # 2. Scrape new messages
-            messages = scrape_channel()
-            for msg in messages:
-                if msg["id"] > state.last_msg_id:
-                    process_signal(msg)
-
-            # 3. Manage open positions (TP/SL)
-            check_positions()
-
+            poll_telegram()
+            monitor_channels()
+            check_and_manage_positions()
             consecutive_errors = 0
             time.sleep(POLL_INTERVAL)
-
         except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            state.save()
+            logger.info("Shutdown")
             break
         except Exception as e:
             consecutive_errors += 1
-            logger.error(f"Main loop error: {e}\n{traceback.format_exc()}")
-            if consecutive_errors >= 10:
-                tg_send(f"❌ Too many errors, sleeping 60s\n{str(e)[:200]}")
+            logger.error(f"Loop error: {e}\n{traceback.format_exc()}")
+            if consecutive_errors >= 8:
+                tg_send(f"❌ أخطاء متكررة\n{str(e)[:200]}")
                 time.sleep(60)
                 consecutive_errors = 0
             else:
-                time.sleep(min(30, consecutive_errors * 3))
+                time.sleep(min(20, consecutive_errors * 2))
 
 if __name__ == "__main__":
     main()
