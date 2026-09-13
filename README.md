@@ -1,74 +1,53 @@
-# Multi-Chain Wallet Tracker + MEXC Spot Bot
+# MEXC SPOT Auto Trader
 
-بوت Telegram لمراقبة تحويلات التوكنات على **BSC + Base**، مع إمكانية شراء تلقائي على MEXC Spot عند ظهور فرص سحب جماعي.
+Single-file Python bot that monitors a public Telegram channel via Web Preview and executes **SPOT only** trades on MEXC.
 
-## العرض النظيف
+## Important Warnings
+- SPOT BUY only (LONG signals). SHORT is ignored.
+- Leverage is ignored completely.
+- No Futures / Margin / Swap / Perpetual.
+- No Telegram API ID / Hash / Telethon / Pyrogram.
+- Paper mode is ON by default.
+- You are fully responsible for any losses. Trading involves high risk of capital loss.
+- Past signals do not guarantee future results.
 
-كل توكن يُعرض بهذا الشكل فقط:
+## Files
+- `main.py` — complete logic in one file
+- `requirements.txt`
+- `.env.example`
+- `README.md`
 
-```
-🥇 PEPE  BSC  ·  $12.4K  📊
-   └ كمية كبيرة · 28 تحويل نشط · BSC
-```
+## Setup (GitHub + Railway)
 
-بدون ضجيج — التوكن + السبب فقط.
+1. Create a new GitHub repository.
+2. Upload these 4 files.
+3. On Railway: New Project → Deploy from GitHub repo.
+4. Add Environment Variables (copy from `.env.example` and fill real values). Never put secrets in the code.
+5. Deploy. The service runs 24/7.
+6. Create a Telegram Bot via @BotFather → put the token in `TELEGRAM_BOT_TOKEN`.
+7. Get your numeric Telegram user ID (via @userinfobot) → `TELEGRAM_ADMIN_ID`.
+8. Start with `PAPER_MODE=true` and `TRADING_ENABLED=false`.
+9. Message your bot: `/start` `/status` `/test`.
+10. After thorough testing only: turn paper off (`/paper`) then enable trading (`/on`). Use a very small `TRADE_AMOUNT_USDT`.
 
-## الشبكات
+## Bot Commands
+- `/start` — help
+- `/status` — system status
+- `/on` — enable trading
+- `/off` — disable trading
+- `/stop` — kill switch (immediate stop)
+- `/balance` — MEXC Spot balances
+- `/positions` — open positions managed by the bot
+- `/amount 15` — change trade size in USDT
+- `/paper` — toggle paper mode
+- `/settings` — current settings
+- `/last` — last detected signal
+- `/test` — connectivity test
 
-| الشبكة | المصدر |
-|--------|--------|
-| BSC | Bloxroute + backup |
-| Base | Bloxroute + backup |
-
-السعر والرمز من Dexscreener عند الحاجة.
-
-## الحفظ الدائم (مهم جداً)
-
-الصفقات + الإعدادات + المحافظ كلها محفوظة في قاعدة بيانات واحدة.
-
-| الطريقة | الحالة |
-|---------|--------|
-| **PostgreSQL** (`DATABASE_URL`) | ✅ ثابت — موصى به على Railway |
-| **SQLite على Volume** (`/data/trades.db`) | ✅ ثابت إذا ربطت Volume على `/data` |
-| **SQLite عادي** (بدون Volume) | ⚠️ يضيع عند إعادة تشغيل الخدمة |
-
-### على Railway
-
-1. أضف خدمة **PostgreSQL** واربط متغير `DATABASE_URL` بالبوت  
-   **أو**
-2. أضف **Volume** على المسار `/data` (البوت هيستخدم `/data/trades.db` تلقائياً)
-
-بدون أحد الخيارين، كل شيء يضيع لو البوت فصل واتعمل له redeploy.
-
-## متغيرات البيئة
-
-- `TELEGRAM_BOT_TOKEN` (مطلوب)
-- `TELEGRAM_CHAT_ID` (موصى به)
-- `MEXC_API_KEY` / `MEXC_API_SECRET` (للتداول)
-- `DATABASE_URL` (PostgreSQL — الأفضل)
-- `SQLITE_DB_PATH` (اختياري — افتراضي `/data/trades.db` لو Volume موجود)
-
-## التشغيل
-
-```bash
-python bot.py
-```
-
-## الأوامر / الأزرار
-
-| الأمر / الزر | الوظيفة |
-|--------------|---------|
-| `إضافة اسم 0x...` | إضافة محفظة |
-| `إضافة حوت اسم 0x...` | إضافة حوت |
-| `حذف الاسم` | حذف محفظة |
-| زر 🐋 حيتان توكن | بحث حيتان |
-| زر ⚙️ إعدادات التداول | حجم / وقف / أهداف / شراء تلقائي |
-| زر 📋 صفقاتي | عرض وإغلاق الصفقات |
-
-## Score
-
-`score = amount × (1 + count^0.6 / 8)`
-
-## تنبيه
-
-المصادر العامة مجانية وقد تُقيَّد. البيانات للمراقبة وليست توصية تداول.
+## Safety Features
+- Secrets only from environment variables
+- Hard limit on trade size
+- Skips all old messages on first start
+- Idempotent (Message ID + hash) to prevent double execution
+- Only the admin ID can control the bot
+- SPOT market only, no leverage, no short
