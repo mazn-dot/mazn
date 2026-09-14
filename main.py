@@ -120,6 +120,7 @@ def init_db():
                 enabled INTEGER DEFAULT 1,
                 last_msg_id BIGINT DEFAULT 0,
                 template TEXT DEFAULT 'auto',
+                sample_text TEXT DEFAULT '',
                 added_at TEXT
             )
         """)
@@ -181,6 +182,7 @@ def init_db():
                 enabled INTEGER DEFAULT 1,
                 last_msg_id INTEGER DEFAULT 0,
                 template TEXT DEFAULT 'auto',
+                sample_text TEXT DEFAULT '',
                 added_at TEXT
             )
         """)
@@ -1024,6 +1026,36 @@ def process_signal(msg: Dict):
     if not sig:
         return
 
+    # If channel has a custom sample template, require basic similarity
+    try:
+        conn = get_db()
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT sample_text FROM channels WHERE username=%s", (channel,))
+            row = cur.fetchone()
+        else:
+            try:
+                row = conn.execute("SELECT sample_text FROM channels WHERE username=?", (channel,)).fetchone()
+            except Exception:
+                row = None
+        conn.close()
+        sample = (row.get("sample_text") if row else "") or ""
+        if sample and len(sample) > 20:
+            # simple keyword overlap check
+            sample_words = set(re.findall(r"[\w\u0600-\u06FF]{3,}", sample.lower()))
+            msg_words = set(re.findall(r"[\w\u0600-\u06FF]{3,}", text.lower()))
+            # keep only meaningful trading words
+            important = {"long", "short", "enter", "entry", "target", "stop", "spot", "سبوت", "دخول", "هدف", "وقف", "لونج"}
+            sample_imp = sample_words & important
+            msg_imp = msg_words & important
+            if sample_imp and not (sample_imp & msg_imp):
+                # also allow if prices exist in both
+                if not re.search(r"\d+\.\d+", text):
+                    logger.info(f"Skip @{channel} msg - low similarity to template")
+                    return
+    except Exception as e:
+        logger.debug(f"similarity check: {e}")
+
     key = signal_key(channel, msg_id, sig)
     if already_processed(key):
         logger.info(f"Skip duplicate key {key}")
@@ -1343,27 +1375,54 @@ def handle_text_message(text: str, chat_id: str):
         if len(username) < 3:
             tg_send("اسم قناة غير صالح")
             return
+        # Save username temporarily and ask for sample template
+        waiting_for[chat_id] = f"add_template:{username}"
+        tg_send(
+            f"تم استلام القناة @{username}\n\n"
+            "الآن أرسل <b>نموذج توصية</b> من هذه القناة (انسخ رسالة توصية قديمة والصقها هنا).\n"
+            "البوت سيستخدم هذا النموذج لتمييز صفقات هذه القناة.\n\n"
+            "أو أرسل /skip لتخطي واستخدام الوضع التلقائي."
+        )
+        return
+
+    if chat_id in waiting_for and str(waiting_for[chat_id]).startswith("add_template:"):
+        username = waiting_for[chat_id].split(":", 1)[1]
+        sample = text.strip()
+        template_name = "custom"
+        if sample.lower() in ("/skip", "skip", "تخطي"):
+            sample = ""
+            template_name = "auto"
+
         conn = get_db()
         try:
             if USE_POSTGRES:
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (%s, 1, 0, %s) ON CONFLICT (username) DO NOTHING",
-                    (username, datetime.now(timezone.utc).isoformat())
+                    """INSERT INTO channels (username, enabled, last_msg_id, template, sample_text, added_at)
+                       VALUES (%s, 1, 0, %s, %s, %s)
+                       ON CONFLICT (username) DO UPDATE SET template=EXCLUDED.template, sample_text=EXCLUDED.sample_text""",
+                    (username, template_name, sample[:1500], datetime.now(timezone.utc).isoformat())
                 )
-                if cur.rowcount == 0:
-                    tg_send("القناة موجودة مسبقًا")
-                else:
-                    tg_send(f"✅ تمت إضافة @{username}")
+                tg_send(f"✅ تمت إضافة @{username}\nالنموذج: {template_name}")
             else:
                 try:
+                    # ensure columns exist
+                    try:
+                        conn.execute("ALTER TABLE channels ADD COLUMN sample_text TEXT DEFAULT ''")
+                    except Exception:
+                        pass
+                    try:
+                        conn.execute("ALTER TABLE channels ADD COLUMN template TEXT DEFAULT 'auto'")
+                    except Exception:
+                        pass
                     conn.execute(
-                        "INSERT INTO channels (username, enabled, last_msg_id, added_at) VALUES (?, 1, 0, ?)",
-                        (username, datetime.now(timezone.utc).isoformat())
+                        """INSERT OR REPLACE INTO channels (username, enabled, last_msg_id, template, sample_text, added_at)
+                           VALUES (?, 1, 0, ?, ?, ?)""",
+                        (username, template_name, sample[:1500], datetime.now(timezone.utc).isoformat())
                     )
-                    tg_send(f"✅ تمت إضافة @{username}")
-                except sqlite3.IntegrityError:
-                    tg_send("القناة موجودة مسبقًا")
+                    tg_send(f"✅ تمت إضافة @{username}\nالنموذج: {template_name}")
+                except Exception as e:
+                    tg_send(f"خطأ: {e}")
             conn.commit()
         finally:
             conn.close()
@@ -1391,7 +1450,7 @@ last_update_id = 0
 
 def poll_telegram():
     global last_update_id
-    res = tg_api("getUpdates", {"offset": last_update_id + 1, "timeout": 10, "limit": 20})
+    res = tg_api("getUpdates", {"offset": last_update_id + 1, "timeout": 2, "limit": 20})
     if not res or not res.get("ok"):
         return
     for u in res.get("result", []):
@@ -1455,6 +1514,17 @@ def print_banner():
     print("Control                : Telegram Bot (Buttons)")
     print("=" * 55)
 
+def telegram_worker():
+    """Background thread: only handles bot commands/buttons so response is fast."""
+    logger.info("Telegram worker started")
+    while True:
+        try:
+            poll_telegram()
+            time.sleep(0.4)  # very short sleep for responsive buttons
+        except Exception as e:
+            logger.error(f"Telegram worker error: {e}")
+            time.sleep(2)
+
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
         logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID required")
@@ -1463,6 +1533,10 @@ def main():
     init_db()
     print_banner()
     init_exchange()
+
+    # Start fast Telegram listener in background
+    t = threading.Thread(target=telegram_worker, daemon=True)
+    t.start()
 
     tg_send(
         "🚀 البوت يعمل الآن\n"
@@ -1474,7 +1548,7 @@ def main():
     consecutive_errors = 0
     while True:
         try:
-            poll_telegram()
+            # Main thread focuses on channel monitoring + position management
             monitor_channels()
             check_and_manage_positions()
             consecutive_errors = 0
