@@ -262,6 +262,24 @@ def init_db():
         )
 
     conn.commit()
+
+    # --- Ensure new columns exist (safe for already-created tables) ---
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS template TEXT DEFAULT 'auto'")
+            cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS sample_text TEXT DEFAULT ''")
+            conn.commit()
+        else:
+            for col, default in [("template", "'auto'"), ("sample_text", "''")]:
+                try:
+                    conn.execute(f"ALTER TABLE channels ADD COLUMN {col} TEXT DEFAULT {default}")
+                    conn.commit()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"Column migration warning: {e}")
+
     conn.close()
     db_type = "PostgreSQL (Railway)" if USE_POSTGRES else "SQLite"
     logger.info(f"Database initialized → {db_type}")
@@ -1370,6 +1388,12 @@ def handle_text_message(text: str, chat_id: str):
     if chat_id != TELEGRAM_ADMIN_ID:
         return
     if chat_id in waiting_for and waiting_for[chat_id] == "add_channel":
+        if text.startswith("/"):
+            tg_send("أضف اسم القناة بدون /  (مثال: abojasimp)\nأو /cancel للإلغاء")
+            if text.strip().lower() in ("/cancel", "/start", "/menu"):
+                del waiting_for[chat_id]
+                tg_send("تم الإلغاء", main_menu_keyboard())
+            return
         username = text.strip().lstrip("@").lower()
         username = re.sub(r"[^a-z0-9_]", "", username)
         if len(username) < 3:
@@ -1386,6 +1410,10 @@ def handle_text_message(text: str, chat_id: str):
         return
 
     if chat_id in waiting_for and str(waiting_for[chat_id]).startswith("add_template:"):
+        if text.strip().lower() in ("/cancel", "/start", "/menu"):
+            del waiting_for[chat_id]
+            tg_send("تم الإلغاء", main_menu_keyboard())
+            return
         username = waiting_for[chat_id].split(":", 1)[1]
         sample = text.strip()
         template_name = "custom"
@@ -1397,12 +1425,20 @@ def handle_text_message(text: str, chat_id: str):
         try:
             if USE_POSTGRES:
                 cur = conn.cursor()
-                cur.execute(
-                    """INSERT INTO channels (username, enabled, last_msg_id, template, sample_text, added_at)
-                       VALUES (%s, 1, 0, %s, %s, %s)
-                       ON CONFLICT (username) DO UPDATE SET template=EXCLUDED.template, sample_text=EXCLUDED.sample_text""",
-                    (username, template_name, sample[:1500], datetime.now(timezone.utc).isoformat())
-                )
+                try:
+                    cur.execute(
+                        """INSERT INTO channels (username, enabled, last_msg_id, template, sample_text, added_at)
+                           VALUES (%s, 1, 0, %s, %s, %s)
+                           ON CONFLICT (username) DO UPDATE SET template=EXCLUDED.template, sample_text=EXCLUDED.sample_text""",
+                        (username, template_name, sample[:1500], datetime.now(timezone.utc).isoformat())
+                    )
+                except Exception:
+                    cur.execute(
+                        """INSERT INTO channels (username, enabled, last_msg_id, template, added_at)
+                           VALUES (%s, 1, 0, %s, %s)
+                           ON CONFLICT (username) DO UPDATE SET template=EXCLUDED.template""",
+                        (username, template_name, datetime.now(timezone.utc).isoformat())
+                    )
                 tg_send(f"✅ تمت إضافة @{username}\nالنموذج: {template_name}")
             else:
                 try:
@@ -1516,14 +1552,20 @@ def print_banner():
 
 def telegram_worker():
     """Background thread: only handles bot commands/buttons so response is fast."""
+    # Clear any webhook so getUpdates works (prevents 409 Conflict)
+    try:
+        tg_api("deleteWebhook", {"drop_pending_updates": False})
+        logger.info("Webhook cleared (if any)")
+    except Exception as e:
+        logger.warning(f"deleteWebhook: {e}")
     logger.info("Telegram worker started")
     while True:
         try:
             poll_telegram()
-            time.sleep(0.4)  # very short sleep for responsive buttons
+            time.sleep(0.35)
         except Exception as e:
             logger.error(f"Telegram worker error: {e}")
-            time.sleep(2)
+            time.sleep(3)
 
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
