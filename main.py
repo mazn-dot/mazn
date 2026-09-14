@@ -119,9 +119,14 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 enabled INTEGER DEFAULT 1,
                 last_msg_id BIGINT DEFAULT 0,
+                template TEXT DEFAULT 'auto',
                 added_at TEXT
             )
         """)
+        try:
+            cur.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS template TEXT DEFAULT 'auto'")
+        except Exception:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 id SERIAL PRIMARY KEY,
@@ -175,9 +180,14 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 enabled INTEGER DEFAULT 1,
                 last_msg_id INTEGER DEFAULT 0,
+                template TEXT DEFAULT 'auto',
                 added_at TEXT
             )
         """)
+        try:
+            cur.execute("ALTER TABLE channels ADD COLUMN template TEXT DEFAULT 'auto'")
+        except Exception:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -431,17 +441,25 @@ def channels_keyboard() -> dict:
     try:
         if USE_POSTGRES:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT username, enabled FROM channels ORDER BY id")
+            cur.execute("SELECT username, enabled, COALESCE(template,'auto') as template FROM channels ORDER BY id")
             rows = cur.fetchall()
         else:
-            rows = conn.execute("SELECT username, enabled FROM channels ORDER BY id").fetchall()
+            try:
+                rows = conn.execute("SELECT username, enabled, COALESCE(template,'auto') as template FROM channels ORDER BY id").fetchall()
+            except Exception:
+                rows = conn.execute("SELECT username, enabled FROM channels ORDER BY id").fetchall()
+                rows = [dict(r) | {"template": "auto"} for r in rows]
     finally:
         conn.close()
     buttons = []
     for r in rows:
         status = "✅" if r["enabled"] else "❌"
-        buttons.append([{"text": f"{status} @{r['username']}", "callback_data": f"ch_toggle_{r['username']}"}])
-        buttons.append([{"text": f"🗑 حذف @{r['username']}", "callback_data": f"ch_del_{r['username']}"}])
+        tmpl = r.get("template") or "auto"
+        buttons.append([{"text": f"{status} @{r['username']} [{tmpl}]", "callback_data": f"ch_toggle_{r['username']}"}])
+        buttons.append([
+            {"text": f"📋 نموذج @{r['username']}", "callback_data": f"ch_tmpl_{r['username']}"},
+            {"text": f"🗑 حذف", "callback_data": f"ch_del_{r['username']}"},
+        ])
     buttons.append([{"text": "➕ إضافة قناة", "callback_data": "ch_add"}])
     buttons.append([{"text": "🔙 رجوع", "callback_data": "menu"}])
     return {"inline_keyboard": buttons}
@@ -500,23 +518,23 @@ def normalize_symbol(raw: str) -> Optional[str]:
         return None
     return f"{s}/USDT"
 
-def parse_signal(text: str) -> Optional[Dict]:
+def parse_signal(text: str, template: str = "auto") -> Optional[Dict]:
+    """
+    Flexible parser supporting multiple channel formats.
+    template: "auto" | "arabic_spot" | "english_long"
+    """
     if not text or len(text) < 8:
         return None
     original = text
     text_lower = text.lower()
-    text_clean = text.replace("\n", " ")
 
-    # Direction detection (Arabic + English)
+    # Direction
     direction = None
     if re.search(r"\b(long|buy|لونج|شراء|سبوت|spot)\b", text_lower) or "🟢" in text:
         direction = "LONG"
-    elif re.search(r"\b(short|sell|شورت|بيع)\b", text_lower) or "🔴" in text and "long" not in text_lower:
-        # only mark short if explicit
-        if re.search(r"\b(short|شورت)\b", text_lower):
-            direction = "SHORT"
+    elif re.search(r"\b(short|شورت|بيع)\b", text_lower):
+        direction = "SHORT"
     if not direction:
-        # if has entry + target + stop → assume LONG for this channel style
         if re.search(r"(دخول|enter|entry|هدف|target|وقف|stop)", text_lower):
             direction = "LONG"
         else:
@@ -526,38 +544,48 @@ def parse_signal(text: str) -> Optional[Dict]:
     lev_match = re.search(r"(?:leverage|lev|x|×)\s*[:=]?\s*(\d+)", text_lower)
     leverage = int(lev_match.group(1)) if lev_match else None
 
-    def find_price(patterns):
+    def find_prices(patterns):
+        results = []
         for p in patterns:
-            m = re.search(p, text, re.IGNORECASE | re.DOTALL)
-            if m:
+            for m in re.finditer(p, text, re.IGNORECASE | re.DOTALL):
                 try:
-                    val = m.group(1).replace(",", "").replace("..", "").strip()
-                    # handle 0.18.. style
-                    val = re.sub(r"\.+$", "", val)
-                    return float(val)
-                except:
+                    raw = m.group(1).replace(",", "").replace("..", "").strip()
+                    raw = re.sub(r"\.+$", "", raw)
+                    if "-" in raw and re.match(r"^[\d.]+-[\d.]+$", raw):
+                        parts = raw.split("-")
+                        val = float(parts[0])
+                    else:
+                        val = float(raw)
+                    if val > 0:
+                        results.append(val)
+                except Exception:
                     pass
-        return None
+        return results
 
-    entry = find_price([
-        r"(?:الدخول من السعر الحالي|دخول|enter|entry|سعر الدخول)\s*[:=]?\s*([\d.]+)",
-        r"(?:enter|entry)\s*[:=]?\s*([\d.]+)",
-        r"الدخول\s*[:=]?\s*([\d.]+)",
+    entries = find_prices([
+        r"(?:الدخول من السعر الحالي|دخول|enter|entry|سعر الدخول)\s*[:=]?\s*([\d.\-]+)",
+        r"(?:enter|entry)\s*[:=]?\s*([\d.\-]+)",
     ])
-    target = find_price([
-        r"(?:الهدف الاول|الهدف الأول|هدف اول|target|tp|تارجيت|الهدف)\s*[:=]?\s*([\d.]+)",
+    entry = entries[0] if entries else None
+
+    targets = find_prices([
+        r"(?:الهدف الاول|الهدف الأول|هدف اول|target|tp|تارجيت|الهدف)\s*(?:الاول|الأول|1)?\s*[:=]?\s*([\d.]+)",
+        r"(?:الهدف الثاني|هدف ثاني|target\s*2|tp2)\s*[:=]?\s*([\d.]+)",
+        r"(?:الهدف الثالث|هدف ثالث|target\s*3|tp3)\s*[:=]?\s*([\d.]+)",
         r"(?:target|tp)\s*[:=]?\s*([\d.]+)",
         r"الهدف\s*[:=]?\s*([\d.]+)",
     ])
-    stop = find_price([
-        r"(?:الوقف|وقف|stop|sl|ستوب)\s*(?:اغلاق يوم اسفل|إغلاق يوم أسفل)?\s*[:=]?\s*([\d.]+)",
+    targets = sorted(set(targets))
+    target = targets[0] if targets else None
+
+    stops = find_prices([
+        r"(?:الوقف|وقف|stop|sl|ستوب)\s*(?:اغلاق يوم|إغلاق يوم|اسفل|أسفل)?\s*[:=]?\s*([\d.]+)",
         r"(?:stop|sl)\s*[:=]?\s*([\d.]+)",
         r"الوقف\s*[:=]?\s*([\d.]+)",
     ])
+    stop = stops[0] if stops else None
 
-    # Symbol extraction – improved for both styles
     symbol = None
-    # 1. Explicit patterns
     for p in [
         r"(?:#|\$)?([A-Za-z]{2,12})\s*(?:USDT|/USDT)?",
         r"([A-Za-z]{2,12})\s*/\s*USDT",
@@ -571,14 +599,11 @@ def parse_signal(text: str) -> Optional[Dict]:
                 symbol = candidate
                 break
 
-    # 2. First meaningful word that looks like ticker
     if not symbol:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for ln in lines[:5]:
-            # remove emojis and noise
+        for ln in lines[:6]:
             clean = re.sub(r"[^\w\s/]", " ", ln)
-            words = clean.split()
-            for w in words:
+            for w in clean.split():
                 candidate = normalize_symbol(w)
                 if candidate:
                     symbol = candidate
@@ -589,7 +614,6 @@ def parse_signal(text: str) -> Optional[Dict]:
     if not symbol:
         return None
 
-    # Must have at least some price info or clear direction
     if not any([entry, target, stop]) and direction != "LONG":
         return None
 
@@ -598,10 +622,13 @@ def parse_signal(text: str) -> Optional[Dict]:
         "direction": direction,
         "leverage": leverage,
         "entry": entry,
-        "target": target,   # used as reference if present
+        "target": target,
+        "targets": targets,
         "stop": stop,
-        "raw": original[:600],
+        "raw": original[:700],
+        "template": template,
     }
+
 
 def signal_key(channel: str, msg_id: int, sig: Dict) -> str:
     s = f"{channel}|{msg_id}|{sig['symbol']}|{sig['direction']}|{sig.get('entry')}|{sig.get('stop')}"
@@ -750,7 +777,15 @@ def open_position(sig: Dict, order: Dict, settings: Dict):
     tp2 = price * (1 + settings["tp2_pct"] / 100)
     tp3 = price * (1 + settings["tp3_pct"] / 100)
 
-    if sig.get("target") and sig["target"] > price:
+    # Prefer targets from the signal itself if present
+    sig_targets = sig.get("targets") or []
+    if len(sig_targets) >= 1 and sig_targets[0] > price:
+        tp1 = float(sig_targets[0])
+    if len(sig_targets) >= 2 and sig_targets[1] > price:
+        tp2 = float(sig_targets[1])
+    if len(sig_targets) >= 3 and sig_targets[2] > price:
+        tp3 = float(sig_targets[2])
+    elif sig.get("target") and sig["target"] > price:
         tp1 = float(sig["target"])
 
     sl = float(sig["stop"]) if sig.get("stop") and sig["stop"] > 0 else price * 0.95
@@ -965,14 +1000,52 @@ def process_signal(msg: Dict):
     msg_id = msg["id"]
     text = msg["text"]
 
-    sig = parse_signal(text)
+    # Get channel template if any
+    template = "auto"
+    try:
+        conn = get_db()
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT template FROM channels WHERE username=%s", (channel,))
+            row = cur.fetchone()
+        else:
+            # template column may not exist yet on old DBs
+            try:
+                row = conn.execute("SELECT template FROM channels WHERE username=?", (channel,)).fetchone()
+            except Exception:
+                row = None
+        if row and row.get("template"):
+            template = row["template"]
+        conn.close()
+    except Exception:
+        pass
+
+    sig = parse_signal(text, template=template)
     if not sig:
         return
 
     key = signal_key(channel, msg_id, sig)
     if already_processed(key):
+        logger.info(f"Skip duplicate key {key}")
         return
     mark_processed(key)
+
+    # Extra protection: do not open another position on same symbol if already open
+    conn = get_db()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT id FROM positions WHERE symbol=%s AND status='open'", (sig["symbol"],))
+            existing = cur.fetchone()
+        else:
+            existing = conn.execute("SELECT id FROM positions WHERE symbol=? AND status='open'", (sig["symbol"],)).fetchone()
+        if existing:
+            logger.info(f"Skip {sig['symbol']} - already have open position")
+            tg_send(f"ℹ️ تم تجاهل {sig['symbol']} لأنها مفتوحة بالفعل")
+            return
+    finally:
+        conn.close()
+
 
     # Update last_msg_id for channel
     conn = get_db()
@@ -1189,6 +1262,48 @@ def handle_callback(cq: dict):
         finally:
             conn.close()
         tg_send(f"تم حذف @{user}")
+        handle_callback({"data": "channels", "id": cq_id, "message": msg})
+
+    elif data.startswith("ch_tmpl_"):
+        user = data.replace("ch_tmpl_", "")
+        kb = {
+            "inline_keyboard": [
+                [{"text": "🔄 تلقائي (auto)", "callback_data": f"settmpl_{user}_auto"}],
+                [{"text": "🇸🇦 عربي سبوت", "callback_data": f"settmpl_{user}_arabic_spot"}],
+                [{"text": "🇬🇧 إنجليزي Long", "callback_data": f"settmpl_{user}_english_long"}],
+                [{"text": "🔙 رجوع", "callback_data": "channels"}],
+            ]
+        }
+        tg_edit(chat_id, message_id, f"اختر نموذج الاقتناص لـ @{user}:", kb)
+
+    elif data.startswith("settmpl_"):
+        parts = data.split("_", 2)
+        # settmpl_username_template  → but username may contain _
+        # safer: settmpl_{user}_{tmpl}
+        rest = data[len("settmpl_"):]
+        # last part is template
+        if rest.endswith("_auto"):
+            user, tmpl = rest[:-5], "auto"
+        elif rest.endswith("_arabic_spot"):
+            user, tmpl = rest[:-12], "arabic_spot"
+        elif rest.endswith("_english_long"):
+            user, tmpl = rest[:-14], "english_long"
+        else:
+            user, tmpl = rest, "auto"
+        conn = get_db()
+        try:
+            if USE_POSTGRES:
+                cur = conn.cursor()
+                cur.execute("UPDATE channels SET template=%s WHERE username=%s", (tmpl, user))
+            else:
+                try:
+                    conn.execute("UPDATE channels SET template=? WHERE username=?", (tmpl, user))
+                except Exception:
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+        tg_send(f"✅ تم تعيين نموذج @{user} → {tmpl}")
         handle_callback({"data": "channels", "id": cq_id, "message": msg})
 
     elif data == "ch_add":
